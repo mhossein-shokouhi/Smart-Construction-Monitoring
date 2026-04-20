@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+
+# Local/private files (not meant for the public repo)
+Rogers_Smart_Construction_Demo_Plan.docx
+SMB_connect_command.txt
+
+# Runtime artifacts
+*.log
