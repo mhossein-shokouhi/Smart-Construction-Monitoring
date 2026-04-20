@@ -4,7 +4,7 @@
       "id": 0,
       "name": "Camera 0",
       "location": "Front Gate",
-      "pi_host": "10.43.183.227",
+      "pi_host": "206.87.101.162",
       "pi_port": 8000
     },
     {

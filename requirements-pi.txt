@@ -12,5 +12,13 @@
 fastapi>=0.110
 uvicorn[standard]>=0.27
 pydantic>=2.0
-opencv-python>=4.8
-numpy>=1.24
+# IMPORTANT: stay on NumPy 1.x on the Pi.
+# The apt-installed picamera2 / simplejpeg on Raspberry Pi OS Bookworm are
+# compiled against NumPy 1.x's ABI. Installing NumPy 2.x breaks the IMX500
+# stack with:
+#   ValueError: numpy.dtype size changed, may indicate binary incompatibility.
+#   Expected 96 from C header, got 88 from PyObject
+numpy>=1.24,<2
+# opencv-python wheels < 4.10 are also built against NumPy 1.x, which keeps
+# the whole edge stack on a single, consistent ABI.
+opencv-python>=4.8,<4.10

@@ -206,6 +206,16 @@ SSH into a Pi to change them.
   blocked by a firewall.
 - **Model fails to load on the Pi** – make sure `imx500-all` is installed and
   that the `.rpk` file under `models/` matches the mode you requested.
+- **`ValueError: numpy.dtype size changed ... Expected 96 from C header, got 88 from PyObject`**
+  on the Pi when switching to surveillance / construction mode – this means
+  NumPy 2.x got installed alongside the apt-provided `picamera2` /
+  `simplejpeg`, which on Raspberry Pi OS Bookworm are compiled against
+  NumPy 1.x. Pin NumPy back:
+  ```bash
+  pip install "numpy<2" --force-reinstall
+  ```
+  (`requirements-pi.txt` already pins `numpy<2`, so a fresh
+  `pip install -r requirements-pi.txt` will do the right thing.)
 - **High latency / jitter** – run `performance_metrics/ping_metrics.py
   <pi-ip>` from the laptop to measure the raw network characteristics of the
   link.
