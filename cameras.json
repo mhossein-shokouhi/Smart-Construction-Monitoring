@@ -11,7 +11,28 @@
       "id": 1,
       "name": "Camera 1",
       "location": "Warehouse",
-      "pi_host": "10.43.183.228",
+      "pi_host": "128.189.135.40",
+      "pi_port": 8000
+    },
+    {
+      "id": 2,
+      "name": "Camera 2",
+      "location": "Pump Station",
+      "pi_host": "206.87.134.225",
+      "pi_port": 8000
+    },
+    {
+      "id": 3,
+      "name": "Camera 3",
+      "location": "Bunbury Yard",
+      "pi_host": "206.87.251.89",
+      "pi_port": 8000
+    },
+    {
+      "id": 4,
+      "name": "Camera 4",
+      "location": "Mondays Creek",
+      "pi_host": "128.189.199.152",
       "pi_port": 8000
     }
   ]
