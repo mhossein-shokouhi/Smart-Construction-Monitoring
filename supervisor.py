@@ -277,6 +277,19 @@ def _realtime_session_config() -> dict:
         "model": REALTIME_MODEL,
         "instructions": VOICE_SYSTEM_PROMPT,
         "audio": {
+            "input": {
+                "noise_reduction": {
+                    "type": "far_field",
+                },
+                "turn_detection": {
+                    "type": "server_vad",
+                    "threshold": 0.72,
+                    "prefix_padding_ms": 250,
+                    "silence_duration_ms": 650,
+                    "create_response": True,
+                    "interrupt_response": False,
+                },
+            },
             "output": {
                 "voice": REALTIME_VOICE,
             },
@@ -824,10 +837,13 @@ SUPERVISOR_JS = r"""
       pc: null,
       dc: null,
       micStream: null,
+      micTrack: null,
       audioEl: null,
       handledCalls: new Set(),
       pendingCalls: new Map(),
       lastAssistantText: "",
+      assistantSpeaking: false,
+      resumeMicTimer: null,
     };
 
     function setStatus(text, mode, detail) {
@@ -890,6 +906,40 @@ SUPERVISOR_JS = r"""
       appendEntry("Supervisor", clean);
     }
 
+    function sendRealtimeEvent(event) {
+      if (!state.dc || state.dc.readyState !== "open") return;
+      state.dc.send(JSON.stringify(event));
+    }
+
+    function setMicEnabled(enabled) {
+      if (!state.micTrack) return;
+      state.micTrack.enabled = enabled;
+    }
+
+    function clearInputBuffer() {
+      sendRealtimeEvent({ type: "input_audio_buffer.clear" });
+    }
+
+    function muteMicForAssistant() {
+      state.assistantSpeaking = true;
+      if (state.resumeMicTimer) {
+        window.clearTimeout(state.resumeMicTimer);
+        state.resumeMicTimer = null;
+      }
+      setMicEnabled(false);
+      clearInputBuffer();
+    }
+
+    function resumeMicAfterAssistant() {
+      state.assistantSpeaking = false;
+      if (state.resumeMicTimer) window.clearTimeout(state.resumeMicTimer);
+      state.resumeMicTimer = window.setTimeout(() => {
+        clearInputBuffer();
+        if (state.active) setMicEnabled(true);
+        state.resumeMicTimer = null;
+      }, 550);
+    }
+
     function rememberFunctionCall(item) {
       if (!item || item.type !== "function_call") return;
       const callId = item.call_id || item.id;
@@ -929,15 +979,15 @@ SUPERVISOR_JS = r"""
       }
 
       const output = JSON.stringify(payload.result || payload);
-      state.dc.send(JSON.stringify({
+      sendRealtimeEvent({
         type: "conversation.item.create",
         item: {
           type: "function_call_output",
           call_id: callId,
           output,
         },
-      }));
-      state.dc.send(JSON.stringify({ type: "response.create" }));
+      });
+      sendRealtimeEvent({ type: "response.create" });
     }
 
     function handleRealtimeEvent(raw) {
@@ -949,18 +999,44 @@ SUPERVISOR_JS = r"""
       }
 
       if (event.type === "input_audio_buffer.speech_started") {
+        if (state.assistantSpeaking) {
+          clearInputBuffer();
+          return;
+        }
         setStatus("Listening", "active", "Microphone is live.");
         return;
       }
       if (event.type === "input_audio_buffer.speech_stopped") {
+        if (state.assistantSpeaking) {
+          clearInputBuffer();
+          return;
+        }
         setStatus("Thinking", "working", "Processing your command.");
         return;
       }
+      if (event.type === "input_audio_buffer.committed" && state.assistantSpeaking) {
+        clearInputBuffer();
+        return;
+      }
       if (event.type === "conversation.item.input_audio_transcription.completed") {
+        if (state.assistantSpeaking) return;
         appendEntry("You", event.transcript || "");
         return;
       }
-      if (event.type === "response.audio_transcript.done") {
+      if (event.type === "response.created") {
+        muteMicForAssistant();
+        setStatus("Supervisor speaking", "working", "Microphone is paused to prevent speaker echo.");
+        return;
+      }
+      if (event.type === "response.output_audio.delta" || event.type === "response.audio.delta") {
+        muteMicForAssistant();
+        return;
+      }
+      if (event.type === "response.output_audio.done" || event.type === "response.audio.done") {
+        resumeMicAfterAssistant();
+        return;
+      }
+      if (event.type === "response.audio_transcript.done" || event.type === "response.output_audio_transcript.done") {
         appendAssistantText(event.transcript || "");
         return;
       }
@@ -993,6 +1069,7 @@ SUPERVISOR_JS = r"""
           if (item.type === "function_call") runFunctionCall(item);
           if (item.type === "message") appendAssistantText(extractAssistantText(item));
         });
+        resumeMicAfterAssistant();
         if (state.active) setStatus("Listening", "active", "Microphone is live.");
         return;
       }
@@ -1007,15 +1084,21 @@ SUPERVISOR_JS = r"""
       if (state.dc && state.dc.readyState === "open") {
         try { state.dc.send(JSON.stringify({ type: "response.cancel" })); } catch (error) {}
       }
+      if (state.resumeMicTimer) {
+        window.clearTimeout(state.resumeMicTimer);
+        state.resumeMicTimer = null;
+      }
       if (state.dc) state.dc.close();
       if (state.pc) state.pc.close();
       if (state.micStream) state.micStream.getTracks().forEach((track) => track.stop());
       if (state.audioEl) state.audioEl.srcObject = null;
       state.active = false;
       state.starting = false;
+      state.assistantSpeaking = false;
       state.pc = null;
       state.dc = null;
       state.micStream = null;
+      state.micTrack = null;
       state.handledCalls.clear();
       state.pendingCalls.clear();
     }
@@ -1082,6 +1165,7 @@ SUPERVISOR_JS = r"""
         state.pc = pc;
         state.dc = dc;
         state.micStream = micStream;
+        state.micTrack = micStream.getAudioTracks()[0] || null;
 
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
