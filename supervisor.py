@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 from typing import Optional
 
+from fastapi import Request
+from fastapi.responses import JSONResponse, Response
 import gradio as gr
 import requests
 from openai import OpenAI
@@ -15,6 +17,9 @@ client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 
 CAMERAS_FILE = Path(__file__).with_name("cameras.json")
+REALTIME_MODEL = os.environ.get("OPENAI_REALTIME_MODEL", "gpt-realtime")
+REALTIME_VOICE = os.environ.get("OPENAI_REALTIME_VOICE", "marin")
+REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls"
 
 
 def load_cameras() -> dict:
@@ -210,6 +215,153 @@ Behaviour rules:
   - On error, explain the error in simple terms and suggest what to try.
 - For casual chat, respond normally without mentioning cameras.
 """
+
+
+VOICE_SYSTEM_PROMPT = SYSTEM_PROMPT + """
+
+Voice conversation rules:
+- You are speaking out loud to an operator, so keep responses concise, natural,
+  and easy to understand in one pass.
+- Use a clear, polished, neutral English delivery unless the user asks for a
+  different language or accent.
+- Do not read raw JSON or internal tool names out loud. Summarize the result in
+  plain language after a tool call finishes.
+- When a command changes camera state, briefly confirm the camera id, name, and
+  new mode. When a command is ambiguous, ask a short clarifying question.
+"""
+
+
+def execute_camera_tool(tool_name: str, args) -> dict:
+    """Execute one of the camera tools for realtime voice sessions."""
+    if isinstance(args, str):
+        try:
+            args = json.loads(args) if args else {}
+        except json.JSONDecodeError as e:
+            return {"status": "error", "error": f"Invalid JSON arguments: {str(e)}"}
+    if args is None:
+        args = {}
+    if not isinstance(args, dict):
+        return {"status": "error", "error": "Tool arguments must be an object."}
+
+    if tool_name == "set_camera_mode":
+        try:
+            cam_id = int(args["camera_id"])
+            mode = args["mode"]
+        except (KeyError, ValueError, TypeError) as e:
+            return {
+                "status": "error",
+                "error": f"Missing or invalid argument for set_camera_mode: {str(e)}",
+            }
+        return call_pi_set_mode(cam_id, mode)
+
+    if tool_name == "get_camera_state":
+        try:
+            cam_id = int(args["camera_id"])
+        except (KeyError, ValueError, TypeError) as e:
+            return {
+                "status": "error",
+                "error": f"Missing or invalid argument for get_camera_state: {str(e)}",
+            }
+        return call_pi_get_state(cam_id)
+
+    if tool_name == "list_cameras":
+        return list_cameras_tool()
+
+    return {"status": "error", "error": f"Unknown tool call: {tool_name}"}
+
+
+def _realtime_session_config() -> dict:
+    """Session config sent to OpenAI during the WebRTC SDP handshake."""
+    return {
+        "type": "realtime",
+        "model": REALTIME_MODEL,
+        "instructions": VOICE_SYSTEM_PROMPT,
+        "audio": {
+            "output": {
+                "voice": REALTIME_VOICE,
+            },
+        },
+        "tools": tools,
+        "tool_choice": "auto",
+    }
+
+
+def attach_voice_routes(app) -> None:
+    """Expose small HTTP endpoints used by the browser voice client."""
+    if getattr(app.state, "supervisor_voice_routes_attached", False):
+        return
+    app.state.supervisor_voice_routes_attached = True
+
+    @app.post("/voice/session")
+    async def create_voice_session(request: Request):
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            return JSONResponse(
+                {"error": "OPENAI_API_KEY is not set on the supervisor server."},
+                status_code=500,
+            )
+
+        offer_sdp = (await request.body()).decode("utf-8", errors="replace")
+        if not offer_sdp.strip():
+            return JSONResponse({"error": "Missing WebRTC offer SDP."}, status_code=400)
+
+        try:
+            upstream = requests.post(
+                REALTIME_CALLS_URL,
+                headers={"Authorization": f"Bearer {api_key}"},
+                files={
+                    "sdp": (None, offer_sdp),
+                    "session": (
+                        None,
+                        json.dumps(_realtime_session_config()),
+                        "application/json",
+                    ),
+                },
+                timeout=30,
+            )
+        except requests.RequestException as e:
+            return JSONResponse(
+                {"error": "Failed to reach OpenAI Realtime API.", "details": str(e)},
+                status_code=502,
+            )
+
+        if upstream.status_code >= 400:
+            details = upstream.text[:1200]
+            return JSONResponse(
+                {
+                    "error": "OpenAI Realtime session creation failed.",
+                    "status_code": upstream.status_code,
+                    "details": details,
+                    "message": (
+                        "OpenAI Realtime session creation failed "
+                        f"({upstream.status_code}): {details}"
+                    ),
+                },
+                status_code=upstream.status_code,
+            )
+
+        return Response(content=upstream.text, media_type="application/sdp")
+
+    @app.post("/voice/tool")
+    async def run_voice_tool(request: Request):
+        try:
+            payload = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Request body must be JSON."}, status_code=400)
+
+        tool_name = payload.get("name")
+        tool_args = payload.get("arguments", {})
+        if not tool_name:
+            return JSONResponse({"error": "Missing tool name."}, status_code=400)
+
+        result = execute_camera_tool(tool_name, tool_args)
+        return JSONResponse(
+            {
+                "call_id": payload.get("call_id"),
+                "name": tool_name,
+                "result": result,
+            }
+        )
 
 
 def supervisor_step(user_msg, chat_history, conversation):
@@ -491,6 +643,493 @@ SUPERVISOR_CSS = """
   min-width: 100px;
   box-shadow: 0 4px 18px rgba(0, 0, 0, 0.25);
 }
+
+/* Realtime voice panel */
+.sup-voice-panel {
+  margin: 0 0 16px 0;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.28);
+  overflow: hidden;
+}
+.sup-voice-main {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 16px;
+  flex-wrap: wrap;
+}
+.sup-voice-copy {
+  min-width: 220px;
+  flex: 1;
+}
+.sup-voice-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #8b8b9a;
+}
+.sup-voice-led {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #8b8b9a;
+  box-shadow: none;
+  flex-shrink: 0;
+}
+.sup-voice-panel.active .sup-voice-led,
+.sup-voice-panel.working .sup-voice-led {
+  background: #00d4aa;
+  box-shadow: 0 0 12px rgba(0, 212, 170, 0.7);
+}
+.sup-voice-panel.error .sup-voice-led {
+  background: #ef4444;
+  box-shadow: 0 0 12px rgba(239, 68, 68, 0.55);
+}
+.sup-voice-status {
+  margin-top: 5px;
+  font-size: 0.9375rem;
+  color: #e8e8ed;
+}
+.sup-voice-detail {
+  margin-top: 3px;
+  font-size: 0.75rem;
+  color: #8b8b9a;
+}
+.sup-voice-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 156px;
+  justify-content: center;
+  border: 1px solid rgba(0, 212, 170, 0.35);
+  border-radius: 12px;
+  background: #00a884;
+  color: #0f0f14;
+  padding: 11px 16px;
+  font: inherit;
+  font-size: 0.9375rem;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.25);
+  transition: background 0.2s, transform 0.2s, border-color 0.2s;
+}
+.sup-voice-button:hover {
+  background: #00d4aa;
+  transform: translateY(-1px);
+}
+.sup-voice-button.active {
+  background: rgba(239, 68, 68, 0.9);
+  border-color: rgba(239, 68, 68, 0.55);
+  color: #ffffff;
+}
+.sup-voice-button:disabled {
+  cursor: wait;
+  opacity: 0.75;
+  transform: none;
+}
+.sup-voice-icon {
+  width: 16px;
+  height: 16px;
+  border: 2px solid currentColor;
+  border-radius: 9px 9px 11px 11px;
+  position: relative;
+  display: inline-block;
+}
+.sup-voice-icon::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: -7px;
+  width: 2px;
+  height: 6px;
+  background: currentColor;
+  transform: translateX(-50%);
+}
+.sup-voice-icon::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: -10px;
+  width: 12px;
+  height: 2px;
+  border-radius: 2px;
+  background: currentColor;
+  transform: translateX(-50%);
+}
+.sup-voice-log {
+  max-height: 145px;
+  overflow-y: auto;
+  padding: 10px 16px 14px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(0, 0, 0, 0.16);
+}
+.sup-voice-entry {
+  display: flex;
+  gap: 10px;
+  padding: 5px 0;
+  font-size: 0.8125rem;
+  line-height: 1.4;
+}
+.sup-voice-entry .who {
+  width: 76px;
+  flex-shrink: 0;
+  color: #00d4aa;
+  font-weight: 600;
+}
+.sup-voice-entry .text {
+  color: #e8e8ed;
+  word-break: break-word;
+}
+.sup-voice-entry.muted .who,
+.sup-voice-entry.muted .text {
+  color: #8b8b9a;
+}
+.sup-voice-entry.error .who,
+.sup-voice-entry.error .text {
+  color: #ef4444;
+}
+"""
+
+
+SUPERVISOR_JS = r"""
+() => {
+  const RETRY_MS = 250;
+
+  function initVoiceClient() {
+    const panel = document.getElementById("sup-voice-panel");
+    const button = document.getElementById("sup-voice-toggle");
+    const label = document.getElementById("sup-voice-toggle-label");
+    const statusText = document.getElementById("sup-voice-status-text");
+    const detailText = document.getElementById("sup-voice-detail");
+    const log = document.getElementById("sup-voice-log");
+
+    if (!panel || !button || !label || !statusText || !detailText || !log) {
+      window.setTimeout(initVoiceClient, RETRY_MS);
+      return;
+    }
+    if (panel.dataset.voiceReady === "true") return;
+    panel.dataset.voiceReady = "true";
+
+    const state = {
+      active: false,
+      starting: false,
+      pc: null,
+      dc: null,
+      micStream: null,
+      audioEl: null,
+      handledCalls: new Set(),
+      pendingCalls: new Map(),
+      lastAssistantText: "",
+    };
+
+    function setStatus(text, mode, detail) {
+      panel.classList.remove("active", "working", "error");
+      if (mode) panel.classList.add(mode);
+      statusText.textContent = text;
+      detailText.textContent = detail || "";
+    }
+
+    function setButton(isActive, isBusy) {
+      button.disabled = !!isBusy;
+      button.classList.toggle("active", !!isActive);
+      button.setAttribute("aria-pressed", isActive ? "true" : "false");
+      label.textContent = isActive ? "End voice chat" : "Start voice chat";
+    }
+
+    function appendEntry(who, text, className) {
+      if (!text) return;
+      const empty = log.querySelector(".sup-voice-entry-empty");
+      if (empty) empty.remove();
+      const row = document.createElement("div");
+      row.className = "sup-voice-entry" + (className ? " " + className : "");
+      const whoEl = document.createElement("span");
+      whoEl.className = "who";
+      whoEl.textContent = who;
+      const textEl = document.createElement("span");
+      textEl.className = "text";
+      textEl.textContent = text;
+      row.append(whoEl, textEl);
+      log.appendChild(row);
+      while (log.children.length > 12) log.removeChild(log.firstElementChild);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    function parseMaybeJson(value) {
+      if (!value) return {};
+      if (typeof value === "object") return value;
+      try {
+        return JSON.parse(value);
+      } catch (error) {
+        return {};
+      }
+    }
+
+    function extractAssistantText(item) {
+      const parts = Array.isArray(item?.content) ? item.content : [];
+      return parts.map((part) => {
+        if (part.type === "output_text") return part.text || "";
+        if (part.type === "text") return part.text || "";
+        if (part.type === "audio") return part.transcript || "";
+        if (part.type === "output_audio") return part.transcript || "";
+        return "";
+      }).join("").trim();
+    }
+
+    function appendAssistantText(text) {
+      const clean = String(text || "").trim();
+      if (!clean || clean === state.lastAssistantText) return;
+      state.lastAssistantText = clean;
+      appendEntry("Supervisor", clean);
+    }
+
+    function rememberFunctionCall(item) {
+      if (!item || item.type !== "function_call") return;
+      const callId = item.call_id || item.id;
+      if (!callId) return;
+      const existing = state.pendingCalls.get(callId) || {};
+      state.pendingCalls.set(callId, { ...existing, ...item, call_id: callId });
+    }
+
+    async function runFunctionCall(item) {
+      if (!item || item.type !== "function_call") return;
+      const callId = item.call_id || item.id;
+      const name = item.name;
+      if (!callId || !name || state.handledCalls.has(callId)) return;
+      if (!state.dc || state.dc.readyState !== "open") return;
+
+      state.handledCalls.add(callId);
+      setStatus("Running camera command", "working", name);
+
+      let payload;
+      try {
+        const res = await fetch("/voice/tool", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            call_id: callId,
+            name,
+            arguments: parseMaybeJson(item.arguments),
+          }),
+        });
+        payload = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(payload.error || "Camera tool call failed.");
+        }
+      } catch (error) {
+        payload = { result: { status: "error", error: error.message } };
+        appendEntry("Error", error.message, "error");
+      }
+
+      const output = JSON.stringify(payload.result || payload);
+      state.dc.send(JSON.stringify({
+        type: "conversation.item.create",
+        item: {
+          type: "function_call_output",
+          call_id: callId,
+          output,
+        },
+      }));
+      state.dc.send(JSON.stringify({ type: "response.create" }));
+    }
+
+    function handleRealtimeEvent(raw) {
+      let event;
+      try {
+        event = JSON.parse(raw.data);
+      } catch (error) {
+        return;
+      }
+
+      if (event.type === "input_audio_buffer.speech_started") {
+        setStatus("Listening", "active", "Microphone is live.");
+        return;
+      }
+      if (event.type === "input_audio_buffer.speech_stopped") {
+        setStatus("Thinking", "working", "Processing your command.");
+        return;
+      }
+      if (event.type === "conversation.item.input_audio_transcription.completed") {
+        appendEntry("You", event.transcript || "");
+        return;
+      }
+      if (event.type === "response.audio_transcript.done") {
+        appendAssistantText(event.transcript || "");
+        return;
+      }
+      if (event.type === "response.output_item.added") {
+        rememberFunctionCall(event.item);
+        return;
+      }
+      if (event.type === "response.function_call_arguments.delta") {
+        const existing = state.pendingCalls.get(event.call_id) || { type: "function_call", call_id: event.call_id };
+        existing.arguments = (existing.arguments || "") + (event.delta || "");
+        state.pendingCalls.set(event.call_id, existing);
+        return;
+      }
+      if (event.type === "response.function_call_arguments.done") {
+        const existing = state.pendingCalls.get(event.call_id) || { type: "function_call", call_id: event.call_id };
+        runFunctionCall({
+          ...existing,
+          name: event.name || existing.name,
+          arguments: event.arguments || existing.arguments,
+        });
+        return;
+      }
+      if (event.type === "response.output_item.done") {
+        if (event.item?.type === "function_call") runFunctionCall(event.item);
+        if (event.item?.type === "message") appendAssistantText(extractAssistantText(event.item));
+        return;
+      }
+      if (event.type === "response.done") {
+        (event.response?.output || []).forEach((item) => {
+          if (item.type === "function_call") runFunctionCall(item);
+          if (item.type === "message") appendAssistantText(extractAssistantText(item));
+        });
+        if (state.active) setStatus("Listening", "active", "Microphone is live.");
+        return;
+      }
+      if (event.type === "error") {
+        const message = event.error?.message || "Realtime API error.";
+        appendEntry("Error", message, "error");
+        setStatus("Voice error", "error", message);
+      }
+    }
+
+    function cleanup() {
+      if (state.dc && state.dc.readyState === "open") {
+        try { state.dc.send(JSON.stringify({ type: "response.cancel" })); } catch (error) {}
+      }
+      if (state.dc) state.dc.close();
+      if (state.pc) state.pc.close();
+      if (state.micStream) state.micStream.getTracks().forEach((track) => track.stop());
+      if (state.audioEl) state.audioEl.srcObject = null;
+      state.active = false;
+      state.starting = false;
+      state.pc = null;
+      state.dc = null;
+      state.micStream = null;
+      state.handledCalls.clear();
+      state.pendingCalls.clear();
+    }
+
+    async function startVoice() {
+      if (state.active || state.starting) return;
+      if (!navigator.mediaDevices?.getUserMedia) {
+        setStatus("Voice unavailable", "error", "This browser cannot access a microphone from this page.");
+        return;
+      }
+
+      state.starting = true;
+      setButton(true, true);
+      setStatus("Connecting voice", "working", "Requesting microphone access.");
+
+      try {
+        const pc = new RTCPeerConnection();
+        const dc = pc.createDataChannel("oai-events");
+        const micStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+
+        let audioEl = state.audioEl;
+        if (!audioEl) {
+          audioEl = document.createElement("audio");
+          audioEl.autoplay = true;
+          audioEl.style.display = "none";
+          panel.appendChild(audioEl);
+          state.audioEl = audioEl;
+        }
+
+        micStream.getTracks().forEach((track) => pc.addTrack(track, micStream));
+        pc.ontrack = (event) => {
+          audioEl.srcObject = event.streams[0];
+          audioEl.play().catch(() => {});
+        };
+        dc.addEventListener("open", () => {
+          state.active = true;
+          state.starting = false;
+          setButton(true, false);
+          setStatus("Listening", "active", "Microphone is live.");
+          appendEntry("System", "Voice chat connected.", "muted");
+        });
+        dc.addEventListener("message", handleRealtimeEvent);
+        dc.addEventListener("close", () => {
+          if (state.active) {
+            cleanup();
+            setButton(false, false);
+            setStatus("Voice idle", "", "AI-generated voice is off.");
+          }
+        });
+        pc.addEventListener("connectionstatechange", () => {
+          if (["failed", "disconnected", "closed"].includes(pc.connectionState) && state.active) {
+            cleanup();
+            setButton(false, false);
+            setStatus("Voice disconnected", "error", "Start voice chat again to reconnect.");
+          }
+        });
+
+        state.pc = pc;
+        state.dc = dc;
+        state.micStream = micStream;
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+
+        const sdpResponse = await fetch("/voice/session", {
+          method: "POST",
+          headers: { "Content-Type": "application/sdp" },
+          body: offer.sdp,
+        });
+        const answerSdp = await sdpResponse.text();
+        if (!sdpResponse.ok) {
+          let message = answerSdp || "Failed to create voice session.";
+          try {
+            const parsed = JSON.parse(answerSdp);
+            message = parsed.message || parsed.details || parsed.error || message;
+          } catch (error) {}
+          throw new Error(message);
+        }
+
+        await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
+        setStatus("Finishing connection", "working", "Opening the audio channel.");
+      } catch (error) {
+        cleanup();
+        setButton(false, false);
+        appendEntry("Error", error.message, "error");
+        setStatus("Voice error", "error", error.message);
+      }
+    }
+
+    function stopVoice() {
+      cleanup();
+      setButton(false, false);
+      setStatus("Voice idle", "", "AI-generated voice is off.");
+      appendEntry("System", "Voice chat ended.", "muted");
+    }
+
+    button.addEventListener("click", () => {
+      if (state.active || state.starting) stopVoice();
+      else startVoice();
+    });
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initVoiceClient);
+  } else {
+    initVoiceClient();
+  }
+}
 """
 
 
@@ -536,15 +1175,36 @@ def _camera_roster_html() -> str:
     )
 
 
+def _voice_panel_html() -> str:
+    return """<section class="sup-voice-panel" id="sup-voice-panel">
+  <div class="sup-voice-main">
+    <div class="sup-voice-copy">
+      <div class="sup-voice-title"><span class="sup-voice-led" id="sup-voice-led"></span><span>Voice chat</span></div>
+      <div class="sup-voice-status" id="sup-voice-status-text">Voice idle</div>
+      <div class="sup-voice-detail" id="sup-voice-detail">AI-generated voice is off.</div>
+    </div>
+    <button type="button" class="sup-voice-button" id="sup-voice-toggle" aria-pressed="false">
+      <span class="sup-voice-icon" aria-hidden="true"></span>
+      <span id="sup-voice-toggle-label">Start voice chat</span>
+    </button>
+  </div>
+  <div class="sup-voice-log" id="sup-voice-log">
+    <div class="sup-voice-entry sup-voice-entry-empty muted"><span class="who">System</span><span class="text">Voice events will appear here.</span></div>
+  </div>
+</section>"""
+
+
 def build_ui():
     with gr.Blocks(
         title="Supervisor Agent",
         theme=_supervisor_theme(),
         css=SUPERVISOR_CSS,
+        js=SUPERVISOR_JS,
         fill_width=True,
     ) as demo:
         gr.HTML(_supervisor_header_html())
         gr.HTML(_camera_roster_html())
+        gr.HTML(_voice_panel_html())
 
         chatbot = gr.Chatbot(
             label="Supervisor Agent",
@@ -584,9 +1244,12 @@ def build_ui():
             outputs=[chatbot, conversation_state, user_in],
         )
 
+    attach_voice_routes(demo.app)
     return demo
 
 
 if __name__ == "__main__":
     ui = build_ui()
-    ui.launch()
+    app, _, _ = ui.launch(prevent_thread_lock=True)
+    attach_voice_routes(app)
+    ui.block_thread()

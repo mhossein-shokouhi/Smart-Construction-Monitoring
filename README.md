@@ -182,6 +182,31 @@ The supervisor translates each request into the right HTTP call to the
 corresponding Pi, reports back in natural language, and the dashboard updates
 automatically as soon as frames start arriving.
 
+### Voice chat mode
+
+The supervisor UI also includes a **Start voice chat** button. Click it, allow
+microphone access, and speak commands such as:
+
+- *"Put camera 2 in construction mode."*
+- *"What cameras are available?"*
+- *"Set the front gate camera back to idle."*
+
+Voice chat uses OpenAI's Realtime API over WebRTC. The browser sends microphone
+audio directly through a peer connection and receives natural spoken audio back;
+`supervisor.py` only performs the secure session handshake and executes camera
+tool calls, so your standard `OPENAI_API_KEY` is never exposed to the browser.
+
+Optional voice settings:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `OPENAI_REALTIME_MODEL` | `gpt-realtime` | Realtime speech-to-speech model used by the voice agent. Use `gpt-realtime-2` if it is enabled for your OpenAI project. |
+| `OPENAI_REALTIME_VOICE` | `marin` | Spoken voice returned by the Realtime model |
+
+Microphone access works on `localhost` / `127.0.0.1` in modern browsers. If you
+open the supervisor from another device, serve it over HTTPS so the browser will
+allow microphone capture.
+
 ---
 
 ## Operational modes
