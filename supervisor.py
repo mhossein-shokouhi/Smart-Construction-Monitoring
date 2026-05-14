@@ -286,7 +286,7 @@ def _realtime_session_config() -> dict:
                     "threshold": 0.72,
                     "prefix_padding_ms": 250,
                     "silence_duration_ms": 650,
-                    "create_response": True,
+                    "create_response": False,
                     "interrupt_response": False,
                 },
             },
@@ -815,6 +815,12 @@ SUPERVISOR_CSS = """
 SUPERVISOR_JS = r"""
 () => {
   const RETRY_MS = 250;
+  const MIN_ASSISTANT_MUTE_MS = 3000;
+  const AUDIO_DELTA_MUTE_EXTENSION_MS = 1600;
+  const OUTPUT_SILENCE_HOLD_MS = 2200;
+  const OUTPUT_MONITOR_INTERVAL_MS = 100;
+  const OUTPUT_SILENCE_RMS = 0.012;
+  const OUTPUT_FALLBACK_DONE_DELAY_MS = 7000;
 
   function initVoiceClient() {
     const panel = document.getElementById("sup-voice-panel");
@@ -838,11 +844,25 @@ SUPERVISOR_JS = r"""
       dc: null,
       micStream: null,
       micTrack: null,
+      micSender: null,
+      micDetached: false,
+      micSwitchPromise: Promise.resolve(),
       audioEl: null,
+      audioContext: null,
+      outputSource: null,
+      outputAnalyser: null,
+      outputSamples: null,
+      outputMonitorTimer: null,
       handledCalls: new Set(),
       pendingCalls: new Map(),
       lastAssistantText: "",
+      currentAssistantTranscript: "",
       assistantSpeaking: false,
+      assistantMuteUntil: 0,
+      assistantResponseDone: false,
+      outputSawAudio: false,
+      outputSilentSince: null,
+      outputGuardStartedAt: 0,
       resumeMicTimer: null,
     };
 
@@ -914,30 +934,164 @@ SUPERVISOR_JS = r"""
     function setMicEnabled(enabled) {
       if (!state.micTrack) return;
       state.micTrack.enabled = enabled;
+      if (!state.micSender?.replaceTrack) return;
+
+      const shouldDetach = !enabled;
+      if (state.micDetached === shouldDetach) return;
+      state.micDetached = shouldDetach;
+      const nextTrack = enabled ? state.micTrack : null;
+      state.micSwitchPromise = state.micSwitchPromise
+        .catch(() => {})
+        .then(() => state.micSender.replaceTrack(nextTrack))
+        .catch((error) => {
+          appendEntry("Error", "Microphone routing failed: " + error.message, "error");
+        });
     }
 
     function clearInputBuffer() {
       sendRealtimeEvent({ type: "input_audio_buffer.clear" });
     }
 
+    function isInputBlocked() {
+      return state.assistantSpeaking || state.micDetached || Boolean(state.resumeMicTimer);
+    }
+
+    function getFallbackResumeDelay() {
+      const words = state.currentAssistantTranscript.trim().split(/\s+/).filter(Boolean).length;
+      if (!words) return OUTPUT_FALLBACK_DONE_DELAY_MS;
+      return Math.min(Math.max((words / 2.6) * 1000 + 1800, 4000), 18000);
+    }
+
+    function setupOutputAnalyser(stream) {
+      try {
+        const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContextCtor) return;
+        if (!state.audioContext) state.audioContext = new AudioContextCtor();
+        if (state.audioContext.state === "suspended") {
+          state.audioContext.resume().catch(() => {});
+        }
+        if (state.outputSource) state.outputSource.disconnect();
+        state.outputSource = state.audioContext.createMediaStreamSource(stream);
+        state.outputAnalyser = state.audioContext.createAnalyser();
+        state.outputAnalyser.fftSize = 1024;
+        state.outputAnalyser.smoothingTimeConstant = 0.1;
+        state.outputSamples = new Uint8Array(state.outputAnalyser.fftSize);
+        state.outputSource.connect(state.outputAnalyser);
+      } catch (error) {
+        state.outputAnalyser = null;
+        state.outputSamples = null;
+      }
+    }
+
+    function outputRms() {
+      if (!state.outputAnalyser || !state.outputSamples) return null;
+      state.outputAnalyser.getByteTimeDomainData(state.outputSamples);
+      let sum = 0;
+      for (const value of state.outputSamples) {
+        const centered = (value - 128) / 128;
+        sum += centered * centered;
+      }
+      return Math.sqrt(sum / state.outputSamples.length);
+    }
+
+    function stopOutputMonitor() {
+      if (!state.outputMonitorTimer) return;
+      window.clearInterval(state.outputMonitorTimer);
+      state.outputMonitorTimer = null;
+    }
+
+    function finishAssistantOutputGuard() {
+      stopOutputMonitor();
+      if (state.resumeMicTimer) {
+        window.clearTimeout(state.resumeMicTimer);
+        state.resumeMicTimer = null;
+      }
+      state.assistantSpeaking = false;
+      state.assistantResponseDone = false;
+      state.outputSawAudio = false;
+      state.outputSilentSince = null;
+      state.outputGuardStartedAt = 0;
+      state.assistantMuteUntil = 0;
+      clearInputBuffer();
+      if (state.active) {
+        setMicEnabled(true);
+        setStatus("Listening", "active", "Microphone is live.");
+      }
+    }
+
+    function startOutputMonitor() {
+      if (state.outputMonitorTimer) return;
+      state.outputMonitorTimer = window.setInterval(() => {
+        if (!state.active || !state.assistantSpeaking) {
+          stopOutputMonitor();
+          return;
+        }
+
+        setMicEnabled(false);
+        clearInputBuffer();
+
+        const now = Date.now();
+        const rms = outputRms();
+        const hasOutputAudio = rms !== null && rms > OUTPUT_SILENCE_RMS;
+
+        if (hasOutputAudio) {
+          state.outputSawAudio = true;
+          state.outputSilentSince = null;
+          state.assistantMuteUntil = Math.max(
+            state.assistantMuteUntil,
+            now + AUDIO_DELTA_MUTE_EXTENSION_MS,
+          );
+          return;
+        }
+
+        if (!state.assistantResponseDone) return;
+
+        if (!state.outputSawAudio && rms === null) {
+          if (now - state.outputGuardStartedAt >= getFallbackResumeDelay()) {
+            finishAssistantOutputGuard();
+          }
+          return;
+        }
+
+        if (!state.outputSilentSince) state.outputSilentSince = now;
+
+        const minimumMuteElapsed = now - state.outputGuardStartedAt >= MIN_ASSISTANT_MUTE_MS;
+        const heldSilence = now - state.outputSilentSince >= OUTPUT_SILENCE_HOLD_MS;
+        const pastMuteTail = now >= state.assistantMuteUntil;
+        if (minimumMuteElapsed && heldSilence && pastMuteTail) {
+          finishAssistantOutputGuard();
+        }
+      }, OUTPUT_MONITOR_INTERVAL_MS);
+    }
+
     function muteMicForAssistant() {
       state.assistantSpeaking = true;
+      state.assistantMuteUntil = Math.max(
+        state.assistantMuteUntil,
+        Date.now() + AUDIO_DELTA_MUTE_EXTENSION_MS,
+      );
       if (state.resumeMicTimer) {
         window.clearTimeout(state.resumeMicTimer);
         state.resumeMicTimer = null;
       }
       setMicEnabled(false);
       clearInputBuffer();
+      startOutputMonitor();
     }
 
-    function resumeMicAfterAssistant() {
-      state.assistantSpeaking = false;
+    function markAssistantOutputDone() {
+      state.assistantResponseDone = true;
+      state.assistantMuteUntil = Math.max(
+        state.assistantMuteUntil,
+        Date.now() + AUDIO_DELTA_MUTE_EXTENSION_MS,
+      );
+      startOutputMonitor();
       if (state.resumeMicTimer) window.clearTimeout(state.resumeMicTimer);
       state.resumeMicTimer = window.setTimeout(() => {
-        clearInputBuffer();
-        if (state.active) setMicEnabled(true);
-        state.resumeMicTimer = null;
-      }, 550);
+        if (state.assistantResponseDone && state.assistantSpeaking && !state.outputAnalyser) {
+          finishAssistantOutputGuard();
+        }
+      }, getFallbackResumeDelay());
     }
 
     function rememberFunctionCall(item) {
@@ -999,7 +1153,7 @@ SUPERVISOR_JS = r"""
       }
 
       if (event.type === "input_audio_buffer.speech_started") {
-        if (state.assistantSpeaking) {
+        if (isInputBlocked()) {
           clearInputBuffer();
           return;
         }
@@ -1007,36 +1161,55 @@ SUPERVISOR_JS = r"""
         return;
       }
       if (event.type === "input_audio_buffer.speech_stopped") {
-        if (state.assistantSpeaking) {
+        if (isInputBlocked()) {
           clearInputBuffer();
           return;
         }
         setStatus("Thinking", "working", "Processing your command.");
         return;
       }
-      if (event.type === "input_audio_buffer.committed" && state.assistantSpeaking) {
-        clearInputBuffer();
+      if (event.type === "input_audio_buffer.committed") {
+        if (isInputBlocked()) {
+          clearInputBuffer();
+          return;
+        }
+        setStatus("Thinking", "working", "Processing your command.");
+        sendRealtimeEvent({ type: "response.create" });
         return;
       }
       if (event.type === "conversation.item.input_audio_transcription.completed") {
-        if (state.assistantSpeaking) return;
+        if (isInputBlocked()) return;
         appendEntry("You", event.transcript || "");
         return;
       }
       if (event.type === "response.created") {
+        state.currentAssistantTranscript = "";
+        state.assistantResponseDone = false;
+        state.outputSawAudio = false;
+        state.outputSilentSince = null;
+        state.outputGuardStartedAt = Date.now();
+        state.assistantMuteUntil = Math.max(
+          state.assistantMuteUntil,
+          Date.now() + MIN_ASSISTANT_MUTE_MS,
+        );
         muteMicForAssistant();
         setStatus("Supervisor speaking", "working", "Microphone is paused to prevent speaker echo.");
         return;
       }
       if (event.type === "response.output_audio.delta" || event.type === "response.audio.delta") {
+        state.assistantMuteUntil = Math.max(
+          state.assistantMuteUntil,
+          Date.now() + AUDIO_DELTA_MUTE_EXTENSION_MS,
+        );
         muteMicForAssistant();
         return;
       }
       if (event.type === "response.output_audio.done" || event.type === "response.audio.done") {
-        resumeMicAfterAssistant();
+        markAssistantOutputDone();
         return;
       }
       if (event.type === "response.audio_transcript.done" || event.type === "response.output_audio_transcript.done") {
+        state.currentAssistantTranscript = event.transcript || state.currentAssistantTranscript;
         appendAssistantText(event.transcript || "");
         return;
       }
@@ -1069,8 +1242,8 @@ SUPERVISOR_JS = r"""
           if (item.type === "function_call") runFunctionCall(item);
           if (item.type === "message") appendAssistantText(extractAssistantText(item));
         });
-        resumeMicAfterAssistant();
-        if (state.active) setStatus("Listening", "active", "Microphone is live.");
+        markAssistantOutputDone();
+        if (state.active) setStatus("Finishing response", "working", "Waiting for assistant audio to finish.");
         return;
       }
       if (event.type === "error") {
@@ -1088,6 +1261,13 @@ SUPERVISOR_JS = r"""
         window.clearTimeout(state.resumeMicTimer);
         state.resumeMicTimer = null;
       }
+      stopOutputMonitor();
+      if (state.outputSource) {
+        try { state.outputSource.disconnect(); } catch (error) {}
+      }
+      if (state.audioContext) {
+        try { state.audioContext.close(); } catch (error) {}
+      }
       if (state.dc) state.dc.close();
       if (state.pc) state.pc.close();
       if (state.micStream) state.micStream.getTracks().forEach((track) => track.stop());
@@ -1095,10 +1275,23 @@ SUPERVISOR_JS = r"""
       state.active = false;
       state.starting = false;
       state.assistantSpeaking = false;
+      state.assistantMuteUntil = 0;
       state.pc = null;
       state.dc = null;
       state.micStream = null;
       state.micTrack = null;
+      state.micSender = null;
+      state.micDetached = false;
+      state.micSwitchPromise = Promise.resolve();
+      state.audioContext = null;
+      state.outputSource = null;
+      state.outputAnalyser = null;
+      state.outputSamples = null;
+      state.currentAssistantTranscript = "";
+      state.assistantResponseDone = false;
+      state.outputSawAudio = false;
+      state.outputSilentSince = null;
+      state.outputGuardStartedAt = 0;
       state.handledCalls.clear();
       state.pendingCalls.clear();
     }
@@ -1134,9 +1327,11 @@ SUPERVISOR_JS = r"""
           state.audioEl = audioEl;
         }
 
-        micStream.getTracks().forEach((track) => pc.addTrack(track, micStream));
+        const micTrack = micStream.getAudioTracks()[0] || null;
+        const micSender = micTrack ? pc.addTrack(micTrack, micStream) : null;
         pc.ontrack = (event) => {
           audioEl.srcObject = event.streams[0];
+          setupOutputAnalyser(event.streams[0]);
           audioEl.play().catch(() => {});
         };
         dc.addEventListener("open", () => {
@@ -1165,7 +1360,9 @@ SUPERVISOR_JS = r"""
         state.pc = pc;
         state.dc = dc;
         state.micStream = micStream;
-        state.micTrack = micStream.getAudioTracks()[0] || null;
+        state.micTrack = micTrack;
+        state.micSender = micSender;
+        state.micDetached = false;
 
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
