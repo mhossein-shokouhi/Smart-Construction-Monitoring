@@ -1287,7 +1287,6 @@ def build_ui():
         fill_width=True,
     ) as demo:
         gr.HTML(_supervisor_header_html())
-        gr.HTML(_camera_roster_html())
         gr.HTML(_voice_panel_html())
 
         chatbot = gr.Chatbot(
