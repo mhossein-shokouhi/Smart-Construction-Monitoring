@@ -4,8 +4,8 @@ An AI-agent–based orchestration system for monitoring construction sites with 
 network of edge-AI smart cameras. A natural-language **supervisor agent** on the
 operator's laptop interprets high-level prompts (e.g. *"switch the front gate
 camera to surveillance mode"*) and autonomously reconfigures a fleet of
-Raspberry Pi–backed cameras in real time. The processed video is streamed back
-to the laptop and displayed in a single, elegant dashboard.
+Raspberry Pi–backed cameras in real time. Video is streamed back to the laptop
+and displayed in a single, elegant dashboard.
 
 ---
 
@@ -18,8 +18,9 @@ to the laptop and displayed in a single, elegant dashboard.
  │  supervisor.py             │                           │                             │
  │   └─ LLM + Gradio UI       │                           │  agent_actuator.py          │
  │                            │                           │   └─ launches on demand:    │
- │  stream_receiver_server.py │  ◀─────────────────────── │      • object_detection_*   │
- │   └─ Dashboard + MJPEG     │    processed JPEG frames  │      • segmentation_*       │
+ │  stream_receiver_server.py │  ◀─────────────────────── │      • raw_stream_*         │
+ │   └─ Dashboard + MJPEG     │       JPEG frames         │      • object_detection_*   │
+ │                            │                           │      • segmentation_*       │
  └────────────────────────────┘                           └─────────────────────────────┘
 ```
 
@@ -27,15 +28,14 @@ to the laptop and displayed in a single, elegant dashboard.
    the laptop.
 2. The supervisor (GPT-backed) decides what to do and calls the correct
    Raspberry Pi over HTTP using the camera registry in `cameras.json`.
-3. The Pi's **agent actuator** starts the appropriate edge-AI pipeline on its
-   IMX500 camera:
+3. The Pi's **agent actuator** starts the appropriate camera pipeline:
+   - **Default mode** → raw camera footage streamed to the laptop (`raw_stream_demo.py`)
    - **Surveillance mode** → on-device **object detection** (`object_detection_demo.py`)
    - **Construction mode** → on-device **semantic segmentation** (`segmentation_demo_overlay.py`)
    - **Idle mode** → stop all inference
-4. Each processed frame is annotated on the Pi and streamed back to the
-   laptop's **stream receiver**, which exposes a live dashboard at
-   `http://<laptop-ip>:9000` with per-camera views, latency / FPS metrics, and
-   an event log.
+4. Frames are streamed back to the laptop's **stream receiver**, which exposes
+   a live dashboard at `http://<laptop-ip>:9000` with per-camera views, latency
+   / FPS metrics, and an event log.
 
 Running inference at the edge keeps bandwidth low and latency predictable, so
 the whole system scales to many cameras over a single wireless link (in our
@@ -50,6 +50,7 @@ case, Rogers 5G).
 | `supervisor.py` | LLM supervisor agent + Gradio UI (runs on the laptop) |
 | `stream_receiver_server.py` | Receives streams from all Pis and serves the dashboard (runs on the laptop) |
 | `agent_actuator.py` | FastAPI service that runs on each Raspberry Pi |
+| `raw_stream_demo.py` | Default-mode pipeline (raw Picamera2 stream, no inference overlays) |
 | `object_detection_demo.py` | Surveillance-mode pipeline (IMX500 object detection) |
 | `segmentation_demo_overlay.py` | Construction-mode pipeline (IMX500 semantic segmentation) |
 | `cameras.json` | Registry of cameras → Pi hosts / ports |
@@ -173,6 +174,7 @@ Gradio will open a local web UI (by default `http://127.0.0.1:7860`). Chat with
 the supervisor in plain English:
 
 - *"List the cameras."*
+- *"Put camera 0 in default mode."*
 - *"Put camera 0 in surveillance mode."*
 - *"Switch the warehouse camera to construction mode."*
 - *"What is camera 1 currently doing?"*
@@ -188,6 +190,7 @@ The supervisor UI also includes a **Start voice chat** button. Click it, allow
 microphone access, and speak commands such as:
 
 - *"Put camera 2 in construction mode."*
+- *"Switch the front gate camera to default mode."*
 - *"What cameras are available?"*
 - *"Set the front gate camera back to idle."*
 
@@ -213,11 +216,12 @@ allow microphone capture.
 
 | Mode | What runs on the Pi | Typical use |
 | --- | --- | --- |
+| `default` | Raw Picamera2 stream, no object detection or bounding boxes | Viewing unprocessed live camera footage on the laptop |
 | `surveillance` | Object detection (e.g. NanoDet / MobileNet SSD on the IMX500) | Spotting people, vehicles, and abnormal activity |
 | `construction` | Semantic segmentation (DeepLabV3+ on the IMX500) | Extracting machinery / site structure for digital-twin updates |
 | `idle` | No inference; camera process stopped | Saving power / bandwidth |
 
-All three modes are selectable from the supervisor prompt — you never need to
+All modes are selectable from the supervisor prompt — you never need to
 SSH into a Pi to change them.
 
 ---

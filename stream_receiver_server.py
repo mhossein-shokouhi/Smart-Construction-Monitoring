@@ -1,9 +1,9 @@
 """
 Stream receiver server — run on your laptop.
 
-Accepts JPEG frames POSTed from Raspberry Pis (object_detection_demo.py or
-segmentation_demo_overlay.py) and serves a single dashboard page that lets
-the user switch between cameras via a dropdown menu.
+Accepts JPEG frames POSTed from Raspberry Pis (raw_stream_demo.py,
+object_detection_demo.py, or segmentation_demo_overlay.py) and serves a single
+dashboard page that lets the user switch between cameras via a dropdown menu.
 
 Usage:
   python stream_receiver_server.py [--host 0.0.0.0] [--port 9000]

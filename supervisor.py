@@ -195,6 +195,9 @@ tools = [
         "name": "set_camera_mode",
         "description": (
             "Set the processing mode for a specific camera on its Raspberry Pi. "
+            "Use default for raw video streamed to the laptop without object detection "
+            "or bounding boxes; surveillance for object detection; construction for "
+            "semantic segmentation; idle to stop the camera process. "
             "Each camera has a unique integer id and lives on its own Pi; the "
             "supervisor routes the command to the correct device. For multiple "
             "cameras, call this tool once for each camera id."
@@ -205,7 +208,7 @@ tools = [
                 "camera_id": {"type": "integer", "description": "Unique integer id of the camera."},
                 "mode": {
                     "type": "string",
-                    "enum": ["surveillance", "construction", "idle"],
+                    "enum": ["default", "surveillance", "construction", "idle"],
                 },
             },
             "required": ["camera_id", "mode"],
@@ -257,8 +260,13 @@ Each camera has a unique integer id and is connected to its own Raspberry Pi.
 
 Behaviour rules:
 - Users give natural language requests (e.g. "switch camera 1 to surveillance mode",
+  "put camera 0 in default mode",
   "what is camera 0 doing?", "which cameras do we have?").
 - Use `set_camera_mode` to change the processing mode of a specific camera.
+- Available modes are `default` for raw camera footage streamed to the laptop
+  with no object detection, bounding boxes, or inference overlays;
+  `surveillance` for object detection; `construction` for semantic
+  segmentation; and `idle` to stop the camera process.
 - Use `get_camera_state` to report the current mode / status of a specific camera.
 - If a user asks to control or inspect multiple cameras in one request, call
   the relevant tool once per target camera before summarizing the result. Do

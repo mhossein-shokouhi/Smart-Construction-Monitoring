@@ -35,7 +35,7 @@ camera_modes = {}  # {camera_id: str}
 
 class ModeRequest(BaseModel):
     camera_id: int
-    mode: str  # "surveillance", "construction", "idle"
+    mode: str  # "default", "surveillance", "construction", "idle"
 
 
 class StateRequest(BaseModel):
@@ -45,6 +45,10 @@ class StateRequest(BaseModel):
 # Each value is a list of command parts (argv). Paths are resolved against
 # SCRIPT_DIR so they work regardless of where uvicorn is launched from.
 SCRIPTS = {
+    "default": [
+        sys.executable,
+        str(SCRIPT_DIR / "raw_stream_demo.py"),
+    ],
     "surveillance": [
         sys.executable,
         str(SCRIPT_DIR / "object_detection_demo.py"),
@@ -131,7 +135,7 @@ def get_state(req: StateRequest):
     """
     Return the current operating state of the camera served by this Pi.
 
-    - mode: best-effort current mode ("surveillance", "construction", "idle", or "unknown")
+    - mode: best-effort current mode ("default", "surveillance", "construction", "idle", or "unknown")
     - last_requested_mode: last mode requested by the supervisor
     - process_running: whether an associated process is currently alive
     """
@@ -143,7 +147,7 @@ def get_state(req: StateRequest):
     process_running = proc is not None and proc.poll() is None
     last_requested_mode = camera_modes.get(camera_id, "unknown")
 
-    if not process_running and last_requested_mode in ("surveillance", "construction"):
+    if not process_running and last_requested_mode in ("default", "surveillance", "construction"):
         mode = "idle"
     else:
         mode = last_requested_mode
