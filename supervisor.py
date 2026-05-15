@@ -4,6 +4,8 @@ warnings.filterwarnings("ignore")
 import html
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
 
@@ -13,6 +15,8 @@ import gradio as gr
 import requests
 from openai import OpenAI
 
+from emergency_vlm import EmergencyScanner
+
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 
@@ -21,6 +25,10 @@ REALTIME_MODEL = os.environ.get("OPENAI_REALTIME_MODEL", "gpt-realtime")
 REALTIME_VOICE = os.environ.get("OPENAI_REALTIME_VOICE", "marin")
 REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls"
 SUPERVISOR_MODEL = os.environ.get("OPENAI_SUPERVISOR_MODEL", "gpt-5-mini")
+STREAM_RECEIVER_URL = os.environ.get("STREAM_RECEIVER_URL", "http://127.0.0.1:9000").rstrip("/")
+EMERGENCY_VLM_MODEL = os.environ.get("OPENAI_EMERGENCY_VLM_MODEL", "gpt-5.5")
+EMERGENCY_VLM_DETAIL = os.environ.get("OPENAI_EMERGENCY_VLM_DETAIL", "high")
+EMERGENCY_MATCH_THRESHOLD = float(os.environ.get("EMERGENCY_MATCH_THRESHOLD", "0.75"))
 MAX_TOOL_ROUNDS = 6
 
 
@@ -47,6 +55,21 @@ def load_cameras() -> dict:
 
 
 CAMERAS = load_cameras()
+AGENTIC_MODE_FREE = "free"
+AGENTIC_MODE_EMERGENCY = "emergency"
+_agentic_lock = threading.Lock()
+_agentic_state = {
+    "mode": AGENTIC_MODE_FREE,
+    "emergency_intent": None,
+}
+emergency_scanner = EmergencyScanner(
+    client=client,
+    receiver_url=STREAM_RECEIVER_URL,
+    model=EMERGENCY_VLM_MODEL,
+    image_detail=EMERGENCY_VLM_DETAIL,
+    match_threshold=EMERGENCY_MATCH_THRESHOLD,
+    max_workers=max(4, len(CAMERAS) or 1),
+)
 
 
 def _pi_base_url(camera_id: int) -> Optional[str]:
@@ -107,6 +130,124 @@ def list_cameras_tool() -> dict:
             }
             for cid, info in sorted(CAMERAS.items())
         ],
+    }
+
+
+def _post_receiver_json(path: str, payload: dict) -> None:
+    try:
+        requests.post(f"{STREAM_RECEIVER_URL}{path}", json=payload, timeout=2)
+    except Exception:
+        pass
+
+
+def _publish_agentic_state() -> None:
+    with _agentic_lock:
+        payload = {
+            "mode": _agentic_state["mode"],
+            "emergency_intent": _agentic_state["emergency_intent"],
+            "scanner_running": emergency_scanner.is_running(),
+        }
+    _post_receiver_json("/system/state", payload)
+
+
+def _post_system_log(
+    *,
+    kind: str,
+    level: str,
+    message: str,
+    camera_id: Optional[int] = None,
+) -> None:
+    payload = {
+        "kind": kind,
+        "level": level,
+        "message": message,
+    }
+    if camera_id is not None:
+        payload["camera_id"] = camera_id
+    _post_receiver_json("/system/log", payload)
+
+
+def _set_all_cameras_default() -> list[dict]:
+    camera_ids = sorted(CAMERAS.keys())
+    if not camera_ids:
+        return []
+    with ThreadPoolExecutor(max_workers=min(8, len(camera_ids))) as executor:
+        return list(executor.map(lambda camera_id: call_pi_set_mode(camera_id, "default"), camera_ids))
+
+
+def get_agentic_mode_tool() -> dict:
+    with _agentic_lock:
+        return {
+            "status": "ok",
+            "mode": _agentic_state["mode"],
+            "emergency_intent": _agentic_state["emergency_intent"],
+            "scanner_running": emergency_scanner.is_running(),
+        }
+
+
+def activate_emergency_mode(intent: str) -> dict:
+    clean_intent = str(intent or "").strip()
+    if not clean_intent:
+        return {"status": "error", "error": "Emergency intent cannot be empty."}
+
+    with _agentic_lock:
+        already_active = _agentic_state["mode"] == AGENTIC_MODE_EMERGENCY
+        _agentic_state["mode"] = AGENTIC_MODE_EMERGENCY
+        _agentic_state["emergency_intent"] = clean_intent
+
+    camera_results = _set_all_cameras_default()
+    if already_active:
+        emergency_scanner.update_intent(clean_intent)
+        message = f"Emergency intent updated: {clean_intent}"
+    else:
+        emergency_scanner.start(clean_intent)
+        message = f"Emergency mode activated: {clean_intent}"
+    _publish_agentic_state()
+    _post_system_log(kind="mode", level="critical", message=message)
+
+    failed = [
+        {
+            "camera_id": camera_id,
+            "result": result,
+        }
+        for camera_id, result in zip(sorted(CAMERAS.keys()), camera_results)
+        if result.get("status") != "ok"
+    ]
+    if failed:
+        failed_ids = ", ".join(str(item["camera_id"]) for item in failed)
+        _post_system_log(
+            kind="mode",
+            level="warning",
+            message=f"Emergency default-mode command could not reach camera(s): {failed_ids}.",
+        )
+
+    return {
+        "status": "ok" if not failed else "partial_error",
+        "mode": AGENTIC_MODE_EMERGENCY,
+        "emergency_intent": clean_intent,
+        "scanner_running": emergency_scanner.is_running(),
+        "camera_results": camera_results,
+    }
+
+
+def deactivate_emergency_mode(reason: Optional[str] = None) -> dict:
+    with _agentic_lock:
+        was_active = _agentic_state["mode"] == AGENTIC_MODE_EMERGENCY
+        _agentic_state["mode"] = AGENTIC_MODE_FREE
+        _agentic_state["emergency_intent"] = None
+    emergency_scanner.stop()
+    _publish_agentic_state()
+    if was_active:
+        suffix = f" Reason: {reason.strip()}" if reason and reason.strip() else ""
+        _post_system_log(
+            kind="mode",
+            level="info",
+            message=f"Emergency mode cleared. System returned to Free mode.{suffix}",
+        )
+    return {
+        "status": "ok",
+        "mode": AGENTIC_MODE_FREE,
+        "scanner_running": emergency_scanner.is_running(),
     }
 
 
@@ -239,6 +380,52 @@ tools = [
         ),
         "parameters": {"type": "object", "properties": {}},
     },
+    {
+        "type": "function",
+        "name": "activate_emergency_mode",
+        "description": (
+            "Switch the whole system into Emergency agentic mode. Use this immediately when "
+            "the operator reports an emergency, a missing person, a person of interest, or asks "
+            "the system to search across cameras for a described intent. This sets every reachable "
+            "camera to default mode and starts laptop-side VLM scanning of active streams."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "intent": {
+                    "type": "string",
+                    "description": (
+                        "A concise visual-search intent copied from the operator's request, "
+                        "for example 'missing worker wearing a red hard hat and yellow vest'."
+                    ),
+                },
+            },
+            "required": ["intent"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "deactivate_emergency_mode",
+        "description": (
+            "Return the system to Free agentic mode after the operator says the emergency "
+            "is resolved, cancelled, or should stop."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Optional operator-provided reason for clearing the emergency.",
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "name": "get_agentic_mode",
+        "description": "Report whether the system is currently in Free or Emergency agentic mode.",
+        "parameters": {"type": "object", "properties": {}},
+    },
 ]
 
 
@@ -275,6 +462,17 @@ Behaviour rules:
   above.
 - Use `list_cameras` when the user asks what cameras exist, or when a request
   does not specify which camera_id to act on and you need to list the options.
+- The system also has an agentic mode. It starts in `free`, where cameras may
+  be controlled independently.
+- If the operator reports an emergency, missing person, person of interest, or
+  asks to search all cameras for a visual intent, immediately call
+  `activate_emergency_mode` with a concise visual-search intent copied from the
+  request. Do not ask for confirmation first.
+- In `emergency` mode, all reachable cameras should remain in `default` mode
+  while the laptop-side VLM scanner inspects active streams. If the operator
+  asks to stop or clear the emergency, call `deactivate_emergency_mode`.
+- Use `get_agentic_mode` when the user asks whether the system is in Free or
+  Emergency mode.
 - If the user targets a camera that is not registered, politely say so and list
   the available camera ids.
 - After any tool result, explain clearly what happened:
@@ -319,6 +517,16 @@ def execute_camera_tool(tool_name: str, args: Any) -> dict:
                 "status": "error",
                 "error": f"Missing or invalid argument for set_camera_mode: {str(e)}",
             }
+        with _agentic_lock:
+            current_agentic_mode = _agentic_state["mode"]
+        if current_agentic_mode == AGENTIC_MODE_EMERGENCY and mode != "default":
+            return {
+                "status": "error",
+                "error": (
+                    "Emergency mode is active. Cameras are locked to default mode "
+                    "until the emergency is cleared."
+                ),
+            }
         results = [call_pi_set_mode(camera_id, mode) for camera_id in camera_ids]
         return _combine_camera_results("set_camera_mode", camera_ids, results)
 
@@ -335,6 +543,15 @@ def execute_camera_tool(tool_name: str, args: Any) -> dict:
 
     if tool_name == "list_cameras":
         return list_cameras_tool()
+
+    if tool_name == "activate_emergency_mode":
+        return activate_emergency_mode(str(args.get("intent") or ""))
+
+    if tool_name == "deactivate_emergency_mode":
+        return deactivate_emergency_mode(args.get("reason"))
+
+    if tool_name == "get_agentic_mode":
+        return get_agentic_mode_tool()
 
     return {"status": "error", "error": f"Unknown tool call: {tool_name}"}
 
@@ -444,6 +661,10 @@ def attach_voice_routes(app) -> None:
                 "result": result,
             }
         )
+
+    @app.get("/agentic/state")
+    async def get_agentic_state():
+        return JSONResponse(get_agentic_mode_tool())
 
 
 def supervisor_step(user_msg, chat_history, conversation):
@@ -585,7 +806,7 @@ SUPERVISOR_CSS = """
   margin: 0;
   font-size: 1.5rem;
   font-weight: 600;
-  letter-spacing: -0.02em;
+  letter-spacing: 0;
   background: linear-gradient(135deg, #fff 0%, #00d4aa 100%);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
@@ -596,6 +817,32 @@ SUPERVISOR_CSS = """
   font-size: 0.875rem;
   color: #8b8b9a;
   line-height: 1.45;
+}
+.sup-mode-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(0, 212, 170, 0.35);
+  background: rgba(0, 212, 170, 0.12);
+  color: #00d4aa;
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.sup-mode-chip.emergency {
+  border-color: rgba(239, 68, 68, 0.42);
+  background: rgba(239, 68, 68, 0.14);
+  color: #ff8d8d;
+}
+.sup-mode-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 10px currentColor;
 }
 
 .sup-roster-wrap {
@@ -1450,10 +1697,37 @@ SUPERVISOR_JS = r"""
     });
   }
 
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", initVoiceClient);
-  } else {
+  function initAgenticModeChip() {
+    const chip = document.getElementById("sup-mode-chip");
+    const label = document.getElementById("sup-mode-label");
+    if (!chip || !label) {
+      window.setTimeout(initAgenticModeChip, RETRY_MS);
+      return;
+    }
+    async function refreshMode() {
+      try {
+        const res = await fetch("/agentic/state");
+        const state = await res.json();
+        const emergency = state.mode === "emergency";
+        chip.classList.toggle("emergency", emergency);
+        label.textContent = emergency ? "Emergency" : "Free";
+      } catch (error) {
+        label.textContent = "Unknown";
+      }
+    }
+    refreshMode();
+    window.setInterval(refreshMode, 2000);
+  }
+
+  function initSupervisorUi() {
     initVoiceClient();
+    initAgenticModeChip();
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initSupervisorUi);
+  } else {
+    initSupervisorUi();
   }
 }
 """
@@ -1465,6 +1739,7 @@ def _supervisor_header_html() -> str:
     <h1>Supervisor</h1>
     <p class="sup-sub">Natural-language control for your multi-camera fleet — switch modes, read status, or list registered devices.</p>
   </div>
+  <div class="sup-mode-chip" id="sup-mode-chip"><span class="sup-mode-dot"></span><span id="sup-mode-label">Free</span></div>
 </header>"""
 
 

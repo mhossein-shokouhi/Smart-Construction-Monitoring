@@ -16,6 +16,7 @@ frames are tagged with the camera id.
 
 import argparse
 import asyncio
+import base64
 import json
 import math
 import threading
@@ -35,10 +36,21 @@ _metrics_history = {}  # camera_id -> list of (receive_time, capture_time), max 
 _stream_was_active = {}  # camera_id -> bool
 # Per-camera event log: list of { "time": unix_ts, "message": str }
 _event_log = {}  # camera_id -> list, max MAX_LOG_ENTRIES
+# Global system log and alert-frame cache for supervisor/emergency activity.
+_system_log = []
+_alert_frames = {}
+_next_system_event_id = 1
+_system_state = {
+    "mode": "free",
+    "emergency_intent": None,
+    "scanner_running": False,
+    "updated_at": None,
+}
 _lock = threading.Lock()
 MJPEG_BOUNDARY = "frame"
 MAX_METRICS_SAMPLES = 60
 MAX_LOG_ENTRIES = 80
+MAX_SYSTEM_LOG_ENTRIES = 200
 STREAM_STALE_SEC = 2.0
 
 CAMERAS_FILE = Path(__file__).with_name("cameras.json")
@@ -65,9 +77,6 @@ def _load_registry() -> dict:
     return registry
 
 
-CAMERA_REGISTRY = _load_registry()
-
-
 def _get_args():
     p = argparse.ArgumentParser(description="Receive camera stream from Pi and serve viewer")
     p.add_argument("--host", default="0.0.0.0", help="Bind host")
@@ -91,6 +100,49 @@ def _log_event(camera_id: int, message: str) -> None:
     _event_log[camera_id].append({"time": time.time(), "message": message})
     if len(_event_log[camera_id]) > MAX_LOG_ENTRIES:
         _event_log[camera_id] = _event_log[camera_id][-MAX_LOG_ENTRIES:]
+
+
+def _log_system_event(payload: dict) -> dict:
+    global _next_system_event_id
+
+    entry = {
+        "id": _next_system_event_id,
+        "time": time.time(),
+        "kind": str(payload.get("kind") or "system"),
+        "level": str(payload.get("level") or "info"),
+        "message": str(payload.get("message") or ""),
+    }
+    _next_system_event_id += 1
+
+    camera_id = payload.get("camera_id")
+    if camera_id is not None:
+        try:
+            entry["camera_id"] = int(camera_id)
+        except (TypeError, ValueError):
+            pass
+
+    confidence = payload.get("confidence")
+    if confidence is not None:
+        try:
+            entry["confidence"] = round(float(confidence), 3)
+        except (TypeError, ValueError):
+            pass
+
+    frame_b64 = payload.get("frame_jpeg_b64")
+    if frame_b64:
+        try:
+            _alert_frames[entry["id"]] = base64.b64decode(frame_b64, validate=True)
+            entry["frame_url"] = f"/system/alerts/{entry['id']}.jpg"
+        except Exception:
+            pass
+
+    _system_log.append(entry)
+    if len(_system_log) > MAX_SYSTEM_LOG_ENTRIES:
+        removed = _system_log[:-MAX_SYSTEM_LOG_ENTRIES]
+        del _system_log[:-MAX_SYSTEM_LOG_ENTRIES]
+        for old_entry in removed:
+            _alert_frames.pop(old_entry["id"], None)
+    return dict(entry)
 
 
 def _compute_metrics(camera_id: int) -> dict:
@@ -163,21 +215,22 @@ async def receive_frame(request: Request):
 @app.get("/cameras")
 async def list_cameras():
     """Return union of registered cameras and any that have ever streamed to us."""
+    camera_registry = _load_registry()
     with _lock:
         seen_ids = set(_latest.keys()) | set(_event_log.keys()) | set(_metrics_history.keys())
         last_seen_map = {cid: t[1] for cid, t in _latest.items()}
-    all_ids = sorted(set(CAMERA_REGISTRY.keys()) | seen_ids)
+    all_ids = sorted(set(camera_registry.keys()) | seen_ids)
     now = time.time()
     cameras = []
     for cid in all_ids:
-        info = CAMERA_REGISTRY.get(cid, {})
+        info = camera_registry.get(cid, {})
         last_seen = last_seen_map.get(cid)
         cameras.append({
             "camera_id": cid,
             "name": info.get("name", f"Camera {cid}"),
             "location": info.get("location", ""),
             "pi_host": info.get("pi_host"),
-            "registered": cid in CAMERA_REGISTRY,
+            "registered": cid in camera_registry,
             "last_seen": last_seen,
             "stream_active": last_seen is not None and (now - last_seen) < STREAM_STALE_SEC,
         })
@@ -203,6 +256,78 @@ async def clear_log(camera_id: int = 0):
     with _lock:
         _event_log[camera_id] = []
     return JSONResponse({"status": "ok", "camera_id": camera_id})
+
+
+@app.get("/latest_frame/{camera_id}")
+async def latest_frame(camera_id: int):
+    with _lock:
+        frame = _latest.get(camera_id)
+    if frame is None:
+        return Response(status_code=404)
+    jpeg_bytes, recv_ts = frame
+    return Response(
+        content=jpeg_bytes,
+        media_type="image/jpeg",
+        headers={"X-Receive-Time": str(recv_ts)},
+    )
+
+
+@app.get("/system/state")
+async def get_system_state():
+    with _lock:
+        state = dict(_system_state)
+    return JSONResponse(state)
+
+
+@app.post("/system/state")
+async def update_system_state(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"status": "error", "error": "Request body must be JSON."}, status_code=400)
+
+    with _lock:
+        _system_state["mode"] = str(payload.get("mode") or "free")
+        _system_state["emergency_intent"] = payload.get("emergency_intent")
+        _system_state["scanner_running"] = bool(payload.get("scanner_running"))
+        _system_state["updated_at"] = time.time()
+        state = dict(_system_state)
+    return JSONResponse({"status": "ok", "state": state})
+
+
+@app.get("/system/log")
+async def get_system_log():
+    with _lock:
+        entries = [dict(entry) for entry in _system_log]
+    return JSONResponse(entries)
+
+
+@app.post("/system/log")
+async def append_system_log(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"status": "error", "error": "Request body must be JSON."}, status_code=400)
+    with _lock:
+        entry = _log_system_event(payload)
+    return JSONResponse({"status": "ok", "entry": entry})
+
+
+@app.post("/system/log/clear")
+async def clear_system_log():
+    with _lock:
+        _system_log.clear()
+        _alert_frames.clear()
+    return JSONResponse({"status": "ok"})
+
+
+@app.get("/system/alerts/{event_id}.jpg")
+async def get_alert_frame(event_id: int):
+    with _lock:
+        frame = _alert_frames.get(event_id)
+    if frame is None:
+        return Response(status_code=404)
+    return Response(content=frame, media_type="image/jpeg")
 
 
 async def _mjpeg_stream(camera_id: int):
@@ -291,7 +416,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       margin: 0;
       font-size: 1.5rem;
       font-weight: 600;
-      letter-spacing: -0.02em;
+      letter-spacing: 0;
       background: linear-gradient(135deg, #fff 0%, var(--accent) 100%);
       -webkit-background-clip: text;
       -webkit-text-fill-color: transparent;
@@ -301,6 +426,48 @@ INDEX_HTML = r"""<!DOCTYPE html>
       margin-top: 4px;
       font-size: 0.875rem;
       color: var(--text-muted);
+    }
+    .view-tabs {
+      width: 100%;
+      max-width: 1200px;
+      display: flex;
+      gap: 8px;
+      margin-bottom: 18px;
+    }
+    .view-tab {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 38px;
+      padding: 0 14px;
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      background: rgba(255,255,255,0.03);
+      color: var(--text-muted);
+      font: inherit;
+      font-size: 0.875rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: color 0.2s, background 0.2s, border-color 0.2s;
+    }
+    .view-tab.active {
+      color: var(--text);
+      background: rgba(0, 212, 170, 0.12);
+      border-color: rgba(0, 212, 170, 0.35);
+    }
+    .view-tab-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+    .tab-view {
+      display: none;
+      width: 100%;
+      max-width: 1200px;
+    }
+    .tab-view.active {
+      display: block;
     }
 
     /* ---------- Camera picker (custom dropdown) ---------- */
@@ -691,17 +858,149 @@ INDEX_HTML = r"""<!DOCTYPE html>
       font-style: italic;
       padding: 8px 0;
     }
+    .system-view-shell {
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+    .system-overview {
+      display: grid;
+      grid-template-columns: 180px 1fr 180px;
+      gap: 12px;
+    }
+    .system-stat {
+      min-height: 82px;
+      padding: 14px 16px;
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      background: rgba(255,255,255,0.04);
+    }
+    .system-stat .label {
+      font-size: 0.6875rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-muted);
+    }
+    .system-stat .value {
+      margin-top: 8px;
+      font-size: 1rem;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .system-stat .value.emergency {
+      color: #ff8d8d;
+    }
+    .system-stat.intent .value {
+      font-size: 0.9375rem;
+      font-weight: 500;
+      line-height: 1.4;
+    }
+    .system-log {
+      width: 100%;
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      overflow: hidden;
+      background: rgba(255,255,255,0.04);
+    }
+    .system-log-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--card-border);
+      background: linear-gradient(180deg, rgba(255,255,255,0.06) 0%, transparent 100%);
+    }
+    .system-log-title {
+      font-size: 0.8125rem;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .system-log-list {
+      max-height: min(68vh, 720px);
+      overflow-y: auto;
+      padding: 10px 18px 18px;
+      background: rgba(0,0,0,0.18);
+    }
+    .system-log-empty {
+      padding: 18px 0 10px;
+      color: var(--text-muted);
+      font-style: italic;
+    }
+    .system-entry {
+      display: grid;
+      grid-template-columns: 72px 76px 1fr;
+      gap: 12px;
+      align-items: start;
+      padding: 12px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.05);
+    }
+    .system-entry:last-child {
+      border-bottom: none;
+    }
+    .system-entry .time {
+      color: var(--text-muted);
+      font-size: 0.8125rem;
+      font-variant-numeric: tabular-nums;
+    }
+    .system-entry .badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 24px;
+      padding: 0 8px;
+      border-radius: 999px;
+      border: 1px solid var(--card-border);
+      background: rgba(255,255,255,0.05);
+      color: var(--text-muted);
+      font-size: 0.6875rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .system-entry .content {
+      min-width: 0;
+      color: var(--text);
+      line-height: 1.45;
+    }
+    .system-entry.alert .badge {
+      color: #ff8d8d;
+      border-color: rgba(239, 68, 68, 0.45);
+      background: rgba(239, 68, 68, 0.14);
+    }
+    .system-entry.alert .content strong {
+      color: #fff;
+      font-weight: 700;
+    }
+    .system-entry.warning .badge {
+      color: #ffd166;
+      border-color: rgba(255, 209, 102, 0.35);
+      background: rgba(255, 209, 102, 0.12);
+    }
+    .system-entry img {
+      display: block;
+      width: min(360px, 100%);
+      margin-top: 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(255,255,255,0.12);
+      background: #000;
+    }
     @media (max-width: 860px) {
       .layout { flex-direction: column; }
       .right-col { width: 100%; }
       .cam-picker { min-width: 0; width: 100%; }
+      .system-overview { grid-template-columns: 1fr; }
+      .system-entry { grid-template-columns: 1fr; gap: 8px; }
     }
   </style>
 </head>
 <body>
   <header class="page-header">
     <div class="title-block">
-      <h1>Live stream</h1>
+      <h1>Operations center</h1>
       <p class="sub" id="cam-subtitle">Select a camera to view its feed.</p>
     </div>
     <div class="cam-picker" id="cam-picker">
@@ -717,6 +1016,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <div class="cam-picker-menu" id="cam-picker-menu" role="listbox"></div>
     </div>
   </header>
+  <nav class="view-tabs" aria-label="Dashboard views">
+    <button type="button" class="view-tab active" id="view-tab-live" data-view="live">
+      <span class="view-tab-dot"></span>
+      <span>Live Feed</span>
+    </button>
+    <button type="button" class="view-tab" id="view-tab-system" data-view="system">
+      <span class="view-tab-dot"></span>
+      <span>System Logs</span>
+    </button>
+  </nav>
+  <section class="tab-view active" id="live-view">
   <div class="layout">
     <div class="stream-box">
       <div class="stream-box-top">
@@ -766,6 +1076,34 @@ INDEX_HTML = r"""<!DOCTYPE html>
       </div>
     </div>
   </div>
+  </section>
+  <section class="tab-view" id="system-view">
+    <div class="system-view-shell">
+      <div class="system-overview">
+        <div class="system-stat">
+          <div class="label">Agentic mode</div>
+          <div class="value" id="system-mode-value">Free</div>
+        </div>
+        <div class="system-stat intent">
+          <div class="label">Emergency intent</div>
+          <div class="value" id="system-intent-value">None</div>
+        </div>
+        <div class="system-stat">
+          <div class="label">VLM scanner</div>
+          <div class="value" id="system-scanner-value">Idle</div>
+        </div>
+      </div>
+      <div class="system-log">
+        <div class="system-log-header">
+          <div class="system-log-title">System log</div>
+          <button type="button" class="btn-clear" id="system-log-clear-btn">Clear</button>
+        </div>
+        <div class="system-log-list" id="system-log-list">
+          <div class="system-log-empty">No system events yet.</div>
+        </div>
+      </div>
+    </div>
+  </section>
   <script>
     (function () {
       let cameras = [];
@@ -783,6 +1121,56 @@ INDEX_HTML = r"""<!DOCTYPE html>
       const noCam = document.getElementById('no-cam-placeholder');
       const statusEl = document.getElementById('stream-status');
       const statusText = document.getElementById('stream-status-text');
+      const liveView = document.getElementById('live-view');
+      const systemView = document.getElementById('system-view');
+      const viewTabs = Array.from(document.querySelectorAll('.view-tab'));
+      const systemModeValue = document.getElementById('system-mode-value');
+      const systemIntentValue = document.getElementById('system-intent-value');
+      const systemScannerValue = document.getElementById('system-scanner-value');
+      const systemLogList = document.getElementById('system-log-list');
+      let systemLogInitialized = false;
+      let lastAlertEventId = 0;
+      let alarmContext = null;
+
+      function setView(view) {
+        const showSystem = view === 'system';
+        liveView.classList.toggle('active', !showSystem);
+        systemView.classList.toggle('active', showSystem);
+        viewTabs.forEach(tab => tab.classList.toggle('active', tab.dataset.view === view));
+      }
+
+      viewTabs.forEach(tab => {
+        tab.addEventListener('click', () => setView(tab.dataset.view));
+      });
+
+      function prepareAlarmAudio() {
+        const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContextCtor) return null;
+        if (!alarmContext) alarmContext = new AudioContextCtor();
+        if (alarmContext.state === 'suspended') alarmContext.resume().catch(() => {});
+        return alarmContext;
+      }
+
+      document.addEventListener('pointerdown', prepareAlarmAudio, { once: true });
+
+      function playAlarm() {
+        const ctx = prepareAlarmAudio();
+        if (!ctx) return;
+        const now = ctx.currentTime;
+        [0, 0.22, 0.44].forEach((offset) => {
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.type = 'square';
+          osc.frequency.setValueAtTime(880, now + offset);
+          gain.gain.setValueAtTime(0.0001, now + offset);
+          gain.gain.exponentialRampToValueAtTime(0.13, now + offset + 0.02);
+          gain.gain.exponentialRampToValueAtTime(0.0001, now + offset + 0.16);
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.start(now + offset);
+          osc.stop(now + offset + 0.18);
+        });
+      }
 
       function parseUrlCamera() {
         const m = window.location.hash.match(/#cam=(-?\d+)/);
@@ -992,10 +1380,73 @@ INDEX_HTML = r"""<!DOCTYPE html>
           .catch(() => {});
       }
 
+      function renderSystemEntry(entry) {
+        const level = entry.level || 'info';
+        const isAlert = entry.kind === 'alert';
+        const rowClass = 'system-entry' + (isAlert ? ' alert' : (level === 'warning' ? ' warning' : ''));
+        const label = isAlert ? 'Alert' : (level === 'warning' ? 'Warning' : (entry.kind || 'System'));
+        const body = isAlert
+          ? '<strong>' + escapeHtml(entry.message || '') + '</strong>'
+          : escapeHtml(entry.message || '');
+        const frame = entry.frame_url
+          ? '<img src="' + escapeHtml(entry.frame_url) + '" alt="Alert frame" loading="lazy">'
+          : '';
+        return (
+          '<div class="' + rowClass + '">' +
+            '<div class="time">' + formatLogTime(entry.time) + '</div>' +
+            '<div><span class="badge">' + escapeHtml(label) + '</span></div>' +
+            '<div class="content">' + body + frame + '</div>' +
+          '</div>'
+        );
+      }
+
+      function refreshSystemState() {
+        fetch('/system/state')
+          .then(r => r.json())
+          .then(state => {
+            const emergency = state.mode === 'emergency';
+            systemModeValue.textContent = emergency ? 'Emergency' : 'Free';
+            systemModeValue.className = 'value' + (emergency ? ' emergency' : '');
+            systemIntentValue.textContent = state.emergency_intent || 'None';
+            systemScannerValue.textContent = state.scanner_running ? 'Scanning' : 'Idle';
+          })
+          .catch(() => {});
+      }
+
+      function refreshSystemLog() {
+        fetch('/system/log')
+          .then(r => r.json())
+          .then(entries => {
+            const alerts = entries.filter(entry => entry.kind === 'alert');
+            const newestAlertId = alerts.reduce((maxId, entry) => Math.max(maxId, entry.id || 0), 0);
+            if (systemLogInitialized && newestAlertId > lastAlertEventId) playAlarm();
+            lastAlertEventId = Math.max(lastAlertEventId, newestAlertId);
+            systemLogInitialized = true;
+
+            if (!entries.length) {
+              systemLogList.innerHTML = '<div class="system-log-empty">No system events yet.</div>';
+              return;
+            }
+            systemLogList.innerHTML = entries.map(renderSystemEntry).join('');
+            systemLogList.scrollTop = systemLogList.scrollHeight;
+          })
+          .catch(() => {});
+      }
+
       document.getElementById('log-clear-btn').addEventListener('click', () => {
         if (selectedId == null) return;
         fetch('/log/clear?camera_id=' + selectedId, { method: 'POST' })
           .then(() => refreshLog())
+          .catch(() => {});
+      });
+
+      document.getElementById('system-log-clear-btn').addEventListener('click', () => {
+        fetch('/system/log/clear', { method: 'POST' })
+          .then(() => {
+            lastAlertEventId = 0;
+            systemLogInitialized = false;
+            refreshSystemLog();
+          })
           .catch(() => {});
       });
 
@@ -1008,6 +1459,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
       setInterval(loadCameras, 3000);
       setInterval(refreshMetrics, 500);
       setInterval(refreshLog, 1000);
+      refreshSystemState();
+      refreshSystemLog();
+      setInterval(refreshSystemState, 1000);
+      setInterval(refreshSystemLog, 1000);
     })();
   </script>
 </body>

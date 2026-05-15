@@ -48,6 +48,7 @@ case, Rogers 5G).
 | Path | Role |
 | --- | --- |
 | `supervisor.py` | LLM supervisor agent + Gradio UI (runs on the laptop) |
+| `emergency_vlm.py` | Laptop-side emergency scanner that samples active streams and queries the VLM |
 | `stream_receiver_server.py` | Receives streams from all Pis and serves the dashboard (runs on the laptop) |
 | `agent_actuator.py` | FastAPI service that runs on each Raspberry Pi |
 | `raw_stream_demo.py` | Default-mode pipeline (raw Picamera2 stream, no inference overlays) |
@@ -179,6 +180,8 @@ the supervisor in plain English:
 - *"Switch the warehouse camera to construction mode."*
 - *"What is camera 1 currently doing?"*
 - *"Set all cameras to idle."*
+- *"Emergency: find the missing worker in a red hard hat and yellow vest."*
+- *"Clear the emergency; the worker has been found."*
 
 The supervisor translates each request into the right HTTP call to the
 corresponding Pi, reports back in natural language, and the dashboard updates
@@ -205,6 +208,10 @@ Optional voice settings:
 | --- | --- | --- |
 | `OPENAI_REALTIME_MODEL` | `gpt-realtime` | Realtime speech-to-speech model used by the voice agent. Use `gpt-realtime-2` if it is enabled for your OpenAI project. |
 | `OPENAI_REALTIME_VOICE` | `marin` | Spoken voice returned by the Realtime model |
+| `OPENAI_EMERGENCY_VLM_MODEL` | `gpt-5.5` | Vision-capable model used by the laptop-side emergency scanner |
+| `OPENAI_EMERGENCY_VLM_DETAIL` | `high` | Image detail sent to the emergency VLM (`low`, `high`, or `auto`) |
+| `EMERGENCY_MATCH_THRESHOLD` | `0.75` | Minimum VLM confidence required before the dashboard raises an alert |
+| `STREAM_RECEIVER_URL` | `http://127.0.0.1:9000` | Receiver URL used by the supervisor to read active streams and publish system logs |
 
 Microphone access works on `localhost` / `127.0.0.1` in modern browsers. If you
 open the supervisor from another device, serve it over HTTPS so the browser will
@@ -223,6 +230,21 @@ allow microphone capture.
 
 All modes are selectable from the supervisor prompt — you never need to
 SSH into a Pi to change them.
+
+## Agentic modes
+
+| Mode | Behaviour |
+| --- | --- |
+| `free` | Default state. Each camera can be controlled independently through the supervisor. |
+| `emergency` | Activated when the operator reports an emergency or asks the supervisor to search for a missing person / person of interest. The supervisor commands every reachable camera into `default` mode and starts `emergency_vlm.py` on the laptop. |
+
+While Emergency mode is active, the scanner asks the receiver which streams are
+currently live, samples one latest frame per active camera on each pass, and
+sends those frames to the configured VLM with the operator's visual-search
+intent. Camera feeds remain visible in the receiver dashboard. The dashboard now
+includes a **System Logs** tab; when the VLM reports a match above the configured
+threshold, that tab records a bold alert, stores the triggering frame, and plays
+an alarm sound in the browser.
 
 ---
 
