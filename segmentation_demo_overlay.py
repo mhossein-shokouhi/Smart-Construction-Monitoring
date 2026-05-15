@@ -23,6 +23,17 @@ _frame_queue = None
 _sender_stop = None
 
 
+def _encode_stream_jpeg(frame):
+    """Convert Picamera RGB/RGBA frames to OpenCV's BGR order before JPEG encoding."""
+    if frame.ndim == 3:
+        channels = frame.shape[2]
+        if channels == 4:
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+        elif channels == 3:
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    return cv2.imencode(".jpg", frame)
+
+
 def _stream_sender():
     """Background thread: POST latest JPEG from queue to _stream_url."""
     import urllib.request
@@ -78,7 +89,7 @@ def create_and_draw_masks(request: CompletedRequest):
                 frame = np.clip(blended, 0, 255).astype(np.uint8)
             else:
                 frame = main_rgb
-            _, jpeg = cv2.imencode(".jpg", frame)
+            _, jpeg = _encode_stream_jpeg(frame)
             if jpeg is not None:
                 try:
                     _frame_queue.put_nowait(jpeg.tobytes())

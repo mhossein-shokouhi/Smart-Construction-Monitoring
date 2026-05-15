@@ -5,7 +5,7 @@ import html
 import json
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response
@@ -20,6 +20,8 @@ CAMERAS_FILE = Path(__file__).with_name("cameras.json")
 REALTIME_MODEL = os.environ.get("OPENAI_REALTIME_MODEL", "gpt-realtime")
 REALTIME_VOICE = os.environ.get("OPENAI_REALTIME_VOICE", "marin")
 REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls"
+SUPERVISOR_MODEL = os.environ.get("OPENAI_SUPERVISOR_MODEL", "gpt-5-mini")
+MAX_TOOL_ROUNDS = 6
 
 
 def load_cameras() -> dict:
@@ -108,6 +110,54 @@ def list_cameras_tool() -> dict:
     }
 
 
+def _coerce_camera_ids(args: dict) -> list[int]:
+    """Accept normal and defensive multi-camera argument shapes."""
+    if "camera_ids" in args and args["camera_ids"] is not None:
+        raw_ids = args["camera_ids"]
+    elif "camera_id" in args and args["camera_id"] is not None:
+        raw_ids = args["camera_id"]
+    else:
+        raise KeyError("camera_id")
+
+    if isinstance(raw_ids, str):
+        raw_ids = raw_ids.strip()
+        if raw_ids.lower() in {"all", "*", "every"}:
+            camera_ids = sorted(CAMERAS.keys())
+        elif "," in raw_ids:
+            camera_ids = [part.strip() for part in raw_ids.split(",") if part.strip()]
+        else:
+            camera_ids = [raw_ids]
+    elif isinstance(raw_ids, (list, tuple)):
+        camera_ids = list(raw_ids)
+    else:
+        camera_ids = [raw_ids]
+
+    if not camera_ids:
+        raise ValueError("camera_ids cannot be empty")
+    return [int(camera_id) for camera_id in camera_ids]
+
+
+def _combine_camera_results(action: str, camera_ids: list[int], results: list[dict]) -> dict:
+    """Return a single-camera result unchanged; aggregate multi-camera results."""
+    if len(results) == 1:
+        return results[0]
+
+    ok_count = sum(1 for result in results if result.get("status") == "ok")
+    if ok_count == len(results):
+        status = "ok"
+    elif ok_count > 0:
+        status = "partial_error"
+    else:
+        status = "error"
+
+    return {
+        "status": status,
+        "action": action,
+        "camera_ids": camera_ids,
+        "results": results,
+    }
+
+
 def trim_conversation(conversation, max_interactions=5):
     if not conversation:
         return conversation
@@ -146,7 +196,8 @@ tools = [
         "description": (
             "Set the processing mode for a specific camera on its Raspberry Pi. "
             "Each camera has a unique integer id and lives on its own Pi; the "
-            "supervisor routes the command to the correct device."
+            "supervisor routes the command to the correct device. For multiple "
+            "cameras, call this tool once for each camera id."
         ),
         "parameters": {
             "type": "object",
@@ -163,7 +214,10 @@ tools = [
     {
         "type": "function",
         "name": "get_camera_state",
-        "description": "Get the current operating mode and runtime state of a specific camera.",
+        "description": (
+            "Get the current operating mode and runtime state of a specific camera. "
+            "For multiple cameras, call this tool once for each camera id."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -206,6 +260,11 @@ Behaviour rules:
   "what is camera 0 doing?", "which cameras do we have?").
 - Use `set_camera_mode` to change the processing mode of a specific camera.
 - Use `get_camera_state` to report the current mode / status of a specific camera.
+- If a user asks to control or inspect multiple cameras in one request, call
+  the relevant tool once per target camera before summarizing the result. Do
+  not put multiple ids into a single `camera_id`.
+- If a user asks for "all cameras", target every registered camera id listed
+  above.
 - Use `list_cameras` when the user asks what cameras exist, or when a request
   does not specify which camera_id to act on and you need to list the options.
 - If the user targets a camera that is not registered, politely say so and list
@@ -231,8 +290,8 @@ Voice conversation rules:
 """
 
 
-def execute_camera_tool(tool_name: str, args) -> dict:
-    """Execute one of the camera tools for realtime voice sessions."""
+def execute_camera_tool(tool_name: str, args: Any) -> dict:
+    """Execute one of the camera tools for text and realtime voice sessions."""
     if isinstance(args, str):
         try:
             args = json.loads(args) if args else {}
@@ -245,24 +304,26 @@ def execute_camera_tool(tool_name: str, args) -> dict:
 
     if tool_name == "set_camera_mode":
         try:
-            cam_id = int(args["camera_id"])
+            camera_ids = _coerce_camera_ids(args)
             mode = args["mode"]
         except (KeyError, ValueError, TypeError) as e:
             return {
                 "status": "error",
                 "error": f"Missing or invalid argument for set_camera_mode: {str(e)}",
             }
-        return call_pi_set_mode(cam_id, mode)
+        results = [call_pi_set_mode(camera_id, mode) for camera_id in camera_ids]
+        return _combine_camera_results("set_camera_mode", camera_ids, results)
 
     if tool_name == "get_camera_state":
         try:
-            cam_id = int(args["camera_id"])
+            camera_ids = _coerce_camera_ids(args)
         except (KeyError, ValueError, TypeError) as e:
             return {
                 "status": "error",
                 "error": f"Missing or invalid argument for get_camera_state: {str(e)}",
             }
-        return call_pi_get_state(cam_id)
+        results = [call_pi_get_state(camera_id) for camera_id in camera_ids]
+        return _combine_camera_results("get_camera_state", camera_ids, results)
 
     if tool_name == "list_cameras":
         return list_cameras_tool()
@@ -386,77 +447,53 @@ def supervisor_step(user_msg, chat_history, conversation):
     conversation.append({"role": "user", "content": user_msg})
 
     response = client.responses.create(
-        model="gpt-5-mini",
+        model=SUPERVISOR_MODEL,
         input=conversation,
         tools=tools,
     )
 
-    tool_call = None
-    for item in response.output:
-        if item.type == "function_call":
-            tool_call = item
-            break
+    for _ in range(MAX_TOOL_ROUNDS):
+        tool_calls = [
+            item for item in response.output
+            if getattr(item, "type", None) == "function_call"
+        ]
 
-    if not tool_call:
-        assistant_text = response.output_text
-        conversation.append({"role": "assistant", "content": assistant_text})
-        chat_history.append((user_msg, assistant_text))
-        return chat_history, conversation
-
-    try:
-        args = json.loads(tool_call.arguments) if tool_call.arguments else {}
-    except Exception as e:
-        assistant_text = f"Error parsing tool arguments: {str(e)}"
-        conversation.append({"role": "assistant", "content": assistant_text})
-        chat_history.append((user_msg, assistant_text))
-        return chat_history, conversation
-
-    tool_name = getattr(tool_call, "name", None)
-    tool_result = None
-
-    if tool_name == "set_camera_mode":
-        try:
-            cam_id = int(args["camera_id"])
-            mode = args["mode"]
-        except (KeyError, ValueError, TypeError) as e:
-            assistant_text = f"Missing or invalid argument for set_camera_mode: {str(e)}"
+        if not tool_calls:
+            assistant_text = response.output_text
             conversation.append({"role": "assistant", "content": assistant_text})
             chat_history.append((user_msg, assistant_text))
             return chat_history, conversation
-        tool_result = call_pi_set_mode(cam_id, mode)
-    elif tool_name == "get_camera_state":
-        try:
-            cam_id = int(args["camera_id"])
-        except (KeyError, ValueError, TypeError) as e:
-            assistant_text = f"Missing or invalid argument for get_camera_state: {str(e)}"
-            conversation.append({"role": "assistant", "content": assistant_text})
-            chat_history.append((user_msg, assistant_text))
-            return chat_history, conversation
-        tool_result = call_pi_get_state(cam_id)
-    elif tool_name == "list_cameras":
-        tool_result = list_cameras_tool()
-    else:
-        assistant_text = f"Unknown tool call: {tool_name}"
-        conversation.append({"role": "assistant", "content": assistant_text})
-        chat_history.append((user_msg, assistant_text))
-        return chat_history, conversation
 
-    conversation.extend(response.output)
-    conversation.append({
-        "type": "function_call_output",
-        "call_id": tool_call.call_id,
-        "output": json.dumps(tool_result),
-    })
+        conversation.extend(response.output)
+        for tool_call in tool_calls:
+            call_id = getattr(tool_call, "call_id", None)
+            if not call_id:
+                assistant_text = "The model requested a camera tool without a call id."
+                conversation.append({"role": "assistant", "content": assistant_text})
+                chat_history.append((user_msg, assistant_text))
+                return chat_history, conversation
 
-    followup = client.responses.create(
-        model="gpt-5-mini",
-        input=conversation,
-        tools=tools,
+            tool_result = execute_camera_tool(
+                getattr(tool_call, "name", None),
+                getattr(tool_call, "arguments", None),
+            )
+            conversation.append({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": json.dumps(tool_result),
+            })
+
+        response = client.responses.create(
+            model=SUPERVISOR_MODEL,
+            input=conversation,
+            tools=tools,
+        )
+
+    assistant_text = (
+        "I ran into too many tool-call rounds while trying to finish that "
+        "request. Please try again with fewer camera operations at once."
     )
-
-    assistant_text = followup.output_text
     conversation.append({"role": "assistant", "content": assistant_text})
-
     chat_history.append((user_msg, assistant_text))
     return chat_history, conversation
 

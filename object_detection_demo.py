@@ -25,6 +25,17 @@ _frame_queue = None
 _sender_stop = None
 
 
+def _encode_stream_jpeg(frame):
+    """Convert Picamera RGB/RGBA frames to OpenCV's BGR order before JPEG encoding."""
+    if frame.ndim == 3:
+        channels = frame.shape[2]
+        if channels == 4:
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+        elif channels == 3:
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    return cv2.imencode(".jpg", frame)
+
+
 class Detection:
     def __init__(self, coords, category, conf, metadata):
         """Create a Detection object, recording the bounding box, category and confidence."""
@@ -152,7 +163,7 @@ def draw_detections(request, stream="main"):
         # If streaming, encode and push latest frame inside the context (m.array invalid after exit)
         if _stream_url and _frame_queue is not None:
             frame_copy = m.array.copy()
-            _, jpeg = cv2.imencode(".jpg", frame_copy)
+            _, jpeg = _encode_stream_jpeg(frame_copy)
             if jpeg is not None:
                 try:
                     _frame_queue.put_nowait(jpeg.tobytes())
