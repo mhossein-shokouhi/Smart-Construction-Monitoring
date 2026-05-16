@@ -1,0 +1,14 @@
+[Unit]
+Description=Announce Pi WLAN IP to Google Sheet registry
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/pi-ip-announce.env
+ExecStart=/usr/bin/python3 /home/pi/Final_Demo/pi_ip_registry/announce_ip.py
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
