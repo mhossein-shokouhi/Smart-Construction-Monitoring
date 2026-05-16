@@ -90,7 +90,8 @@ function doPost(e) {
     const values = [String(piId), hostname, ip, iface, now, 'online'];
 
     if (row > 0) {
-      sheet.getRange(row, 1, row, 6).setValues([values]);
+      // getRange(row, col, numRows, numColumns) — third arg is row COUNT, not end row
+      sheet.getRange(row, 1, 1, values.length).setValues([values]);
     } else {
       sheet.appendRow(values);
     }
