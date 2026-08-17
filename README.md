@@ -157,8 +157,10 @@ http://localhost:9000
 ```
 
 You'll see a camera selector, a live MJPEG view, per-camera delay / jitter /
-FPS metrics, and an event log. Cameras appear here as soon as their Pi starts
-streaming frames.
+FPS metrics, and an event log. Choose **Grid View** at the top of the camera
+selector to monitor every known camera at once in a responsive grid. Inactive
+cameras remain visible as black **No stream** tiles and automatically reconnect
+when their Pi starts sending frames.
 
 ---
 

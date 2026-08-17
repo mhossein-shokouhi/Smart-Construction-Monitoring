@@ -3,7 +3,8 @@ Stream receiver server — run on your laptop.
 
 Accepts JPEG frames POSTed from Raspberry Pis (raw_stream_demo.py,
 object_detection_demo.py, or segmentation_demo_overlay.py) and serves a single
-dashboard page that lets the user switch between cameras via a dropdown menu.
+dashboard page that lets the user switch between individual cameras or monitor
+every camera together in a responsive grid.
 
 Usage:
   python stream_receiver_server.py [--host 0.0.0.0] [--port 9000]
@@ -565,12 +566,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
       max-height: 320px;
       overflow-y: auto;
       opacity: 0;
+      visibility: hidden;
       transform: translateY(-4px);
       pointer-events: none;
       transition: opacity 0.15s ease, transform 0.15s ease;
     }
     .cam-picker.open .cam-picker-menu {
       opacity: 1;
+      visibility: visible;
       transform: translateY(0);
       pointer-events: auto;
     }
@@ -586,10 +589,40 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .cam-option:hover {
       background: rgba(255,255,255,0.06);
     }
+    .cam-option:focus-visible {
+      outline: 2px solid rgba(0, 212, 170, 0.75);
+      outline-offset: -2px;
+      background: rgba(255,255,255,0.07);
+    }
     .cam-option.selected {
       background: rgba(0, 212, 170, 0.12);
       border: 1px solid rgba(0, 212, 170, 0.35);
       padding: 9px 11px;
+    }
+    .cam-option.grid-option {
+      margin-bottom: 6px;
+      border-bottom: 1px solid var(--card-border);
+      border-bottom-left-radius: 4px;
+      border-bottom-right-radius: 4px;
+    }
+    .cam-option.grid-option.selected {
+      border-bottom-color: rgba(0, 212, 170, 0.35);
+    }
+    .grid-option-icon {
+      width: 16px;
+      height: 16px;
+      flex-shrink: 0;
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 2px;
+      padding: 1px;
+    }
+    .grid-option-icon span {
+      border-radius: 1px;
+      background: var(--text-muted);
+    }
+    .cam-option.grid-option.selected .grid-option-icon span {
+      background: var(--accent);
     }
     .cam-option .dot {
       width: 8px;
@@ -750,6 +783,144 @@ INDEX_HTML = r"""<!DOCTYPE html>
       background: #000;
       border-radius: 8px;
       font-size: 0.9375rem;
+    }
+    .layout[hidden],
+    .camera-grid[hidden] {
+      display: none;
+    }
+    .camera-grid {
+      --grid-columns: 2;
+      width: 100%;
+      display: grid;
+      grid-template-columns: repeat(var(--grid-columns), minmax(0, 1fr));
+      gap: 18px;
+      align-items: start;
+    }
+    .camera-grid-empty {
+      grid-column: 1 / -1;
+      min-height: 320px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 32px;
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      background: var(--card-bg);
+      color: var(--text-muted);
+      text-align: center;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+    }
+    .camera-tile {
+      min-width: 0;
+      padding: 10px;
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      background: var(--card-bg);
+      overflow: hidden;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(255,255,255,0.03) inset;
+    }
+    .camera-tile-header {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 4px 4px 10px;
+    }
+    .camera-tile-heading {
+      min-width: 0;
+    }
+    .camera-tile-name {
+      overflow: hidden;
+      color: var(--text);
+      font-size: 0.9375rem;
+      font-weight: 600;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .camera-tile-meta {
+      margin-top: 2px;
+      overflow: hidden;
+      color: var(--text-muted);
+      font-size: 0.75rem;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .camera-tile-status {
+      flex-shrink: 0;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 9px;
+      border: 1px solid rgba(239, 68, 68, 0.35);
+      border-radius: 999px;
+      background: rgba(239, 68, 68, 0.18);
+      color: #ef4444;
+      font-size: 0.6875rem;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+    .camera-tile-status .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+    .camera-tile.live .camera-tile-status {
+      border-color: rgba(0, 212, 170, 0.35);
+      background: rgba(0, 212, 170, 0.18);
+      color: var(--accent);
+    }
+    .camera-tile.live .camera-tile-status .dot {
+      box-shadow: 0 0 9px rgba(0, 212, 170, 0.7);
+      animation: pulse-green 2s ease-in-out infinite;
+    }
+    .camera-tile-media {
+      position: relative;
+      width: 100%;
+      height: clamp(210px, 28vh, 290px);
+      overflow: hidden;
+      border-radius: 9px;
+      background: #000;
+    }
+    .camera-tile-media img {
+      position: absolute;
+      inset: 0;
+      z-index: 1;
+      width: 100%;
+      height: 100%;
+      display: none;
+      object-fit: contain;
+      background: #000;
+    }
+    .camera-tile.live .camera-tile-media img {
+      display: block;
+    }
+    .camera-tile-placeholder {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #6f6f7c;
+      font-size: 0.8125rem;
+      letter-spacing: 0.02em;
+    }
+    .camera-tile.live .camera-tile-placeholder {
+      display: none;
+    }
+    .camera-tile.stream-error .camera-tile-status {
+      border-color: rgba(255, 209, 102, 0.35);
+      background: rgba(255, 209, 102, 0.12);
+      color: #ffd166;
+    }
+    .camera-tile.stream-error .camera-tile-media img {
+      display: none;
+    }
+    .camera-tile.stream-error .camera-tile-placeholder {
+      display: flex;
+      color: #9a895d;
     }
     .panel {
       width: 100%;
@@ -992,8 +1163,20 @@ INDEX_HTML = r"""<!DOCTYPE html>
       .layout { flex-direction: column; }
       .right-col { width: 100%; }
       .cam-picker { min-width: 0; width: 100%; }
+      .camera-grid { --grid-columns: 2 !important; }
+      .camera-grid[data-count="1"] { --grid-columns: 1 !important; }
       .system-overview { grid-template-columns: 1fr; }
       .system-entry { grid-template-columns: 1fr; gap: 8px; }
+    }
+    @media (max-width: 720px) {
+      .camera-grid { --grid-columns: 1 !important; }
+      .camera-tile-media {
+        height: auto;
+        aspect-ratio: 16 / 9;
+      }
+    }
+    @media (max-width: 620px) {
+      body { padding: 16px; }
     }
   </style>
 </head>
@@ -1004,8 +1187,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <p class="sub" id="cam-subtitle">Select a camera to view its feed.</p>
     </div>
     <div class="cam-picker" id="cam-picker">
-      <span class="cam-picker-label">Camera</span>
-      <button type="button" class="cam-picker-button" id="cam-picker-button" aria-haspopup="listbox" aria-expanded="false">
+      <span class="cam-picker-label" id="cam-picker-label">Camera view</span>
+      <button type="button" class="cam-picker-button" id="cam-picker-button" aria-haspopup="listbox" aria-expanded="false" aria-labelledby="cam-picker-label cam-button-name">
         <span class="cam-label">
           <span class="dot" id="cam-button-dot"></span>
           <span class="cam-name" id="cam-button-name">Loading…</span>
@@ -1013,7 +1196,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         </span>
         <svg class="chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
       </button>
-      <div class="cam-picker-menu" id="cam-picker-menu" role="listbox"></div>
+      <div class="cam-picker-menu" id="cam-picker-menu" role="listbox" aria-labelledby="cam-picker-label" aria-hidden="true"></div>
     </div>
   </header>
   <nav class="view-tabs" aria-label="Dashboard views">
@@ -1027,7 +1210,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </button>
   </nav>
   <section class="tab-view active" id="live-view">
-  <div class="layout">
+  <div class="layout" id="single-camera-layout">
     <div class="stream-box">
       <div class="stream-box-top">
         <span class="label" id="stream-title-label">Live feed</span>
@@ -1076,6 +1259,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       </div>
     </div>
   </div>
+  <div class="camera-grid" id="camera-grid" role="region" aria-label="All camera feeds" hidden></div>
   </section>
   <section class="tab-view" id="system-view">
     <div class="system-view-shell">
@@ -1108,6 +1292,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
     (function () {
       let cameras = [];
       let selectedId = null;
+      let feedMode = 'single';
+      let activeDashboardView = 'live';
+      let camerasRequestInFlight = false;
 
       const picker = document.getElementById('cam-picker');
       const button = document.getElementById('cam-picker-button');
@@ -1123,6 +1310,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
       const statusText = document.getElementById('stream-status-text');
       const liveView = document.getElementById('live-view');
       const systemView = document.getElementById('system-view');
+      const singleCameraLayout = document.getElementById('single-camera-layout');
+      const cameraGrid = document.getElementById('camera-grid');
       const viewTabs = Array.from(document.querySelectorAll('.view-tab'));
       const systemModeValue = document.getElementById('system-mode-value');
       const systemIntentValue = document.getElementById('system-intent-value');
@@ -1134,9 +1323,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
       function setView(view) {
         const showSystem = view === 'system';
+        activeDashboardView = showSystem ? 'system' : 'live';
         liveView.classList.toggle('active', !showSystem);
         systemView.classList.toggle('active', showSystem);
         viewTabs.forEach(tab => tab.classList.toggle('active', tab.dataset.view === view));
+        syncStreamConnections();
       }
 
       viewTabs.forEach(tab => {
@@ -1172,20 +1363,22 @@ INDEX_HTML = r"""<!DOCTYPE html>
         });
       }
 
-      function parseUrlCamera() {
+      function parseUrlSelection() {
+        if (window.location.hash === '#view=grid' || window.location.hash === '#grid') {
+          return { mode: 'grid', cameraId: null };
+        }
         const m = window.location.hash.match(/#cam=(-?\d+)/);
-        if (m) return parseInt(m[1], 10);
+        if (m) return { mode: 'single', cameraId: parseInt(m[1], 10) };
         const params = new URLSearchParams(window.location.search);
         if (params.has('camera_id')) {
           const v = parseInt(params.get('camera_id'), 10);
-          if (!Number.isNaN(v)) return v;
+          if (!Number.isNaN(v)) return { mode: 'single', cameraId: v };
         }
         return null;
       }
 
-      function setUrlCamera(id) {
-        if (id == null) return;
-        const newHash = '#cam=' + id;
+      function setUrlSelection(mode, id) {
+        const newHash = mode === 'grid' ? '#view=grid' : '#cam=' + id;
         if (window.location.hash !== newHash) {
           history.replaceState(null, '', window.location.pathname + window.location.search + newHash);
         }
@@ -1196,6 +1389,16 @@ INDEX_HTML = r"""<!DOCTYPE html>
       }
 
       function renderButton() {
+        if (feedMode === 'grid') {
+          const liveCount = cameras.filter(cam => cam.stream_active).length;
+          btnDot.className = 'dot' + (liveCount ? ' live' : '');
+          btnName.textContent = 'Grid View';
+          btnMeta.textContent = cameras.length ? liveCount + ' / ' + cameras.length + ' live' : '';
+          subtitle.textContent = cameras.length
+            ? 'All camera feeds · ' + liveCount + ' of ' + cameras.length + ' live'
+            : 'No cameras registered yet.';
+          return;
+        }
         const cam = findCamera(selectedId);
         if (!cam) {
           btnDot.className = 'dot';
@@ -1215,20 +1418,28 @@ INDEX_HTML = r"""<!DOCTYPE html>
       }
 
       function renderMenu() {
-        if (!cameras.length) {
-          menu.innerHTML = '<div class="empty">No cameras registered yet.</div>';
-          return;
-        }
-        menu.innerHTML = cameras.map(cam => {
+        const liveCount = cameras.filter(cam => cam.stream_active).length;
+        const gridSelected = feedMode === 'grid';
+        const gridOption = (
+          '<div class="cam-option grid-option' + (gridSelected ? ' selected' : '') + '" role="option" tabindex="-1" aria-selected="' + gridSelected + '" data-view="grid">' +
+            '<span class="grid-option-icon" aria-hidden="true"><span></span><span></span><span></span><span></span></span>' +
+            '<div class="cam-text">' +
+              '<div class="line1">Grid View</div>' +
+              '<div class="line2">Watch all camera feeds</div>' +
+            '</div>' +
+            '<span class="badge' + (liveCount ? ' live' : '') + '">' + (cameras.length ? liveCount + ' / ' + cameras.length + ' live' : 'Empty') + '</span>' +
+          '</div>'
+        );
+        const cameraOptions = cameras.map(cam => {
           const live = cam.stream_active;
-          const selected = cam.camera_id === selectedId;
+          const selected = feedMode === 'single' && cam.camera_id === selectedId;
           const line2Parts = [];
           if (cam.location) line2Parts.push(cam.location);
           if (cam.pi_host) line2Parts.push('Pi ' + cam.pi_host);
           if (!cam.registered) line2Parts.push('unregistered');
           return (
-            '<div class="cam-option' + (selected ? ' selected' : '') + '" role="option" data-cid="' + cam.camera_id + '">' +
-              '<span class="dot' + (live ? ' live' : '') + '"></span>' +
+            '<div class="cam-option' + (selected ? ' selected' : '') + '" role="option" tabindex="-1" aria-selected="' + selected + '" data-cid="' + cam.camera_id + '">' +
+              '<span class="dot' + (live ? ' live' : '') + '" aria-hidden="true"></span>' +
               '<div class="cam-text">' +
                 '<div class="line1">' + escapeHtml(cam.name || ('Camera ' + cam.camera_id)) + ' <span style="color:var(--text-muted);font-weight:400;">#' + cam.camera_id + '</span></div>' +
                 (line2Parts.length ? '<div class="line2">' + escapeHtml(line2Parts.join(' · ')) + '</div>' : '') +
@@ -1237,11 +1448,19 @@ INDEX_HTML = r"""<!DOCTYPE html>
             '</div>'
           );
         }).join('');
-        menu.querySelectorAll('.cam-option').forEach(el => {
+        menu.innerHTML = gridOption + (cameraOptions || '<div class="empty">No cameras registered yet.</div>');
+        const gridEl = menu.querySelector('[data-view="grid"]');
+        if (gridEl) {
+          gridEl.addEventListener('click', () => {
+            closeMenu(true);
+            selectGridView();
+          });
+        }
+        menu.querySelectorAll('.cam-option[data-cid]').forEach(el => {
           el.addEventListener('click', () => {
             const cid = parseInt(el.getAttribute('data-cid'), 10);
+            closeMenu(true);
             selectCamera(cid);
-            closeMenu();
           });
         });
       }
@@ -1252,11 +1471,52 @@ INDEX_HTML = r"""<!DOCTYPE html>
         })[c]);
       }
 
-      function openMenu() { picker.classList.add('open'); button.setAttribute('aria-expanded', 'true'); }
-      function closeMenu() { picker.classList.remove('open'); button.setAttribute('aria-expanded', 'false'); }
+      function openMenu(focusOption) {
+        picker.classList.add('open');
+        button.setAttribute('aria-expanded', 'true');
+        menu.setAttribute('aria-hidden', 'false');
+        if (focusOption) {
+          const target = menu.querySelector('[aria-selected="true"]') || menu.querySelector('.cam-option');
+          if (target) target.focus();
+        }
+      }
+      function closeMenu(returnFocus) {
+        picker.classList.remove('open');
+        button.setAttribute('aria-expanded', 'false');
+        menu.setAttribute('aria-hidden', 'true');
+        if (returnFocus) button.focus();
+      }
       function toggleMenu() { picker.classList.contains('open') ? closeMenu() : openMenu(); }
 
       button.addEventListener('click', (e) => { e.stopPropagation(); toggleMenu(); });
+      button.addEventListener('keydown', (e) => {
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+          e.preventDefault();
+          openMenu(true);
+        } else if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          picker.classList.contains('open') ? closeMenu(true) : openMenu(true);
+        }
+      });
+      menu.addEventListener('keydown', (e) => {
+        const options = Array.from(menu.querySelectorAll('.cam-option'));
+        const currentIndex = options.indexOf(document.activeElement);
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Home' || e.key === 'End') {
+          e.preventDefault();
+          let nextIndex = currentIndex;
+          if (e.key === 'Home') nextIndex = 0;
+          else if (e.key === 'End') nextIndex = options.length - 1;
+          else if (e.key === 'ArrowDown') nextIndex = Math.min(currentIndex + 1, options.length - 1);
+          else nextIndex = Math.max(currentIndex - 1, 0);
+          if (options[nextIndex]) options[nextIndex].focus();
+        } else if ((e.key === 'Enter' || e.key === ' ') && document.activeElement.classList.contains('cam-option')) {
+          e.preventDefault();
+          document.activeElement.click();
+        } else if (e.key === 'Escape') {
+          e.preventDefault();
+          closeMenu(true);
+        }
+      });
       document.addEventListener('click', (e) => {
         if (!picker.contains(e.target)) closeMenu();
       });
@@ -1264,14 +1524,181 @@ INDEX_HTML = r"""<!DOCTYPE html>
         if (e.key === 'Escape') closeMenu();
       });
 
-      function selectCamera(id) {
-        if (id == null || id === selectedId) {
-          renderButton();
-          renderMenu();
+      function disconnectImage(img) {
+        img.removeAttribute('src');
+        img.dataset.connected = 'false';
+      }
+
+      function disconnectSingleStream() {
+        disconnectImage(streamImg);
+        delete streamImg.dataset.cameraId;
+      }
+
+      function disconnectGridStreams() {
+        cameraGrid.querySelectorAll('.camera-tile-media img').forEach(disconnectImage);
+      }
+
+      function streamsCanPlay() {
+        return activeDashboardView === 'live' && !document.hidden;
+      }
+
+      function syncSingleStream(forceReconnect) {
+        const cam = findCamera(selectedId);
+        if (feedMode !== 'single' || selectedId == null) {
+          disconnectSingleStream();
           return;
         }
+        if (!cam || !cam.stream_active) {
+          disconnectSingleStream();
+          streamImg.style.display = 'none';
+          noCam.textContent = 'No stream';
+          noCam.style.display = 'flex';
+          return;
+        }
+        if (!streamsCanPlay()) {
+          disconnectSingleStream();
+          return;
+        }
+        const cameraKey = String(selectedId);
+        streamImg.style.display = '';
+        noCam.style.display = 'none';
+        if (forceReconnect || streamImg.dataset.cameraId !== cameraKey || !streamImg.getAttribute('src')) {
+          disconnectSingleStream();
+          streamImg.dataset.cameraId = cameraKey;
+          streamImg.dataset.connected = 'true';
+          streamImg.src = '/stream/' + selectedId + '?t=' + Date.now();
+        }
+      }
+
+      function createGridTile(cameraId) {
+        const tile = document.createElement('article');
+        tile.className = 'camera-tile';
+        tile.dataset.cameraId = String(cameraId);
+        tile.innerHTML = (
+          '<div class="camera-tile-header">' +
+            '<div class="camera-tile-heading">' +
+              '<div class="camera-tile-name"></div>' +
+              '<div class="camera-tile-meta"></div>' +
+            '</div>' +
+            '<div class="camera-tile-status"><span class="dot" aria-hidden="true"></span><span class="text">No stream</span></div>' +
+          '</div>' +
+          '<div class="camera-tile-media">' +
+            '<img alt="" />' +
+            '<div class="camera-tile-placeholder">No stream</div>' +
+          '</div>'
+        );
+        const img = tile.querySelector('img');
+        img.dataset.connected = 'false';
+        img.addEventListener('error', () => {
+          disconnectImage(img);
+          img.dataset.retryAfter = String(Date.now() + 3000);
+          tile.classList.add('stream-error');
+          tile.querySelector('.camera-tile-status .text').textContent = 'Reconnecting';
+          tile.querySelector('.camera-tile-placeholder').textContent = 'Reconnecting…';
+        });
+        return tile;
+      }
+
+      function updateGridTile(tile, cam) {
+        const name = cam.name || ('Camera ' + cam.camera_id);
+        const meta = [];
+        if (cam.location) meta.push(cam.location);
+        if (cam.pi_host) meta.push('Pi ' + cam.pi_host);
+        if (!cam.registered) meta.push('unregistered');
+        tile.querySelector('.camera-tile-name').textContent = name + '  #' + cam.camera_id;
+        tile.querySelector('.camera-tile-meta').textContent = meta.join(' · ') || 'Camera ' + cam.camera_id;
+        const active = Boolean(cam.stream_active);
+        tile.classList.toggle('live', active);
+        const img = tile.querySelector('img');
+        img.alt = 'Live stream from ' + name + (cam.location ? ' at ' + cam.location : '');
+        const shouldConnect = active && feedMode === 'grid' && streamsCanPlay();
+        const retryAfter = Number(img.dataset.retryAfter || 0);
+        const waitingToRetry = shouldConnect && retryAfter > Date.now();
+        tile.classList.toggle('stream-error', waitingToRetry);
+        tile.querySelector('.camera-tile-status .text').textContent = waitingToRetry ? 'Reconnecting' : (active ? 'Live' : 'No stream');
+        tile.querySelector('.camera-tile-placeholder').textContent = waitingToRetry ? 'Reconnecting…' : 'No stream';
+        if (shouldConnect && !waitingToRetry && (img.dataset.connected !== 'true' || !img.getAttribute('src'))) {
+          delete img.dataset.retryAfter;
+          img.dataset.connected = 'true';
+          img.src = '/stream/' + cam.camera_id + '?t=' + Date.now();
+        } else if (!shouldConnect) {
+          delete img.dataset.retryAfter;
+          tile.classList.remove('stream-error');
+          if (img.dataset.connected === 'true' || img.getAttribute('src')) disconnectImage(img);
+        }
+      }
+
+      function renderGrid() {
+        const columns = cameras.length <= 1 ? 1 : (cameras.length <= 4 ? 2 : 3);
+        cameraGrid.dataset.count = String(cameras.length);
+        cameraGrid.style.setProperty('--grid-columns', String(columns));
+        const existing = new Map();
+        cameraGrid.querySelectorAll('.camera-tile').forEach(tile => {
+          existing.set(Number(tile.dataset.cameraId), tile);
+        });
+        const empty = cameraGrid.querySelector('.camera-grid-empty');
+        if (empty) empty.remove();
+
+        if (!cameras.length) {
+          disconnectGridStreams();
+          existing.forEach(tile => tile.remove());
+          const message = document.createElement('div');
+          message.className = 'camera-grid-empty';
+          message.textContent = 'No cameras registered yet.';
+          cameraGrid.appendChild(message);
+          return;
+        }
+
+        cameras.forEach((cam, index) => {
+          let tile = existing.get(cam.camera_id);
+          if (!tile) tile = createGridTile(cam.camera_id);
+          updateGridTile(tile, cam);
+          const currentTileAtIndex = cameraGrid.children[index];
+          if (currentTileAtIndex !== tile) cameraGrid.insertBefore(tile, currentTileAtIndex || null);
+          existing.delete(cam.camera_id);
+        });
+        existing.forEach(tile => {
+          const img = tile.querySelector('img');
+          if (img) disconnectImage(img);
+          tile.remove();
+        });
+      }
+
+      function syncStreamConnections(forceSingleReconnect) {
+        if (feedMode === 'grid') {
+          disconnectSingleStream();
+          renderGrid();
+        } else {
+          disconnectGridStreams();
+          syncSingleStream(Boolean(forceSingleReconnect));
+        }
+      }
+
+      function selectGridView() {
+        feedMode = 'grid';
+        setUrlSelection('grid', null);
+        singleCameraLayout.hidden = true;
+        cameraGrid.hidden = false;
+        renderButton();
+        renderMenu();
+        if (activeDashboardView !== 'live') setView('live');
+        else syncStreamConnections();
+      }
+
+      function selectCamera(id) {
+        if (id == null) return;
+        if (feedMode === 'single' && id === selectedId) {
+          renderButton();
+          renderMenu();
+          if (activeDashboardView !== 'live') setView('live');
+          else syncStreamConnections();
+          return;
+        }
+        feedMode = 'single';
         selectedId = id;
-        setUrlCamera(id);
+        setUrlSelection('single', id);
+        singleCameraLayout.hidden = false;
+        cameraGrid.hidden = true;
         // Reset UI values
         document.getElementById('delay').textContent = '--';
         document.getElementById('delay').className = 'value none';
@@ -1282,50 +1709,78 @@ INDEX_HTML = r"""<!DOCTYPE html>
         document.getElementById('log-box').innerHTML = '<div class="empty">Loading…</div>';
         statusEl.className = 'stream-status no-stream';
         statusText.textContent = 'No stream';
-        // Point stream img at new camera (force reconnect)
-        streamImg.style.display = '';
-        noCam.style.display = 'none';
-        streamImg.src = '/stream/' + id + '?t=' + Date.now();
         renderButton();
         renderMenu();
+        if (activeDashboardView !== 'live') setView('live');
+        else syncStreamConnections(true);
         refreshMetrics();
         refreshLog();
       }
 
-      async function loadCameras(initial) {
+      async function loadCameras() {
+        if (camerasRequestInFlight) return;
+        camerasRequestInFlight = true;
         try {
           const res = await fetch('/cameras');
+          if (!res.ok) throw new Error('Unable to load cameras');
           const data = await res.json();
           cameras = Array.isArray(data.cameras) ? data.cameras : [];
         } catch (e) {
-          cameras = [];
+          const urlSelection = parseUrlSelection();
+          if (selectedId == null && feedMode === 'single' && urlSelection && urlSelection.mode === 'grid') {
+            selectGridView();
+          } else {
+            renderButton();
+            renderMenu();
+            if (feedMode === 'grid') renderGrid();
+          }
+          return;
+        } finally {
+          camerasRequestInFlight = false;
         }
-        if (selectedId == null) {
-          const urlCam = parseUrlCamera();
-          if (urlCam != null && findCamera(urlCam)) {
-            selectCamera(urlCam);
+        if (selectedId == null && feedMode === 'single') {
+          const urlSelection = parseUrlSelection();
+          if (urlSelection && urlSelection.mode === 'grid') {
+            selectGridView();
+          } else if (urlSelection && findCamera(urlSelection.cameraId)) {
+            selectCamera(urlSelection.cameraId);
           } else if (cameras.length) {
             const live = cameras.find(c => c.stream_active);
             selectCamera((live || cameras[0]).camera_id);
           } else {
             streamImg.style.display = 'none';
+            noCam.textContent = 'No camera selected.';
+            noCam.style.display = 'flex';
+            renderButton();
+            renderMenu();
+          }
+        } else if (feedMode === 'single' && selectedId != null && !findCamera(selectedId)) {
+          if (cameras.length) {
+            const live = cameras.find(c => c.stream_active);
+            selectCamera((live || cameras[0]).camera_id);
+          } else {
+            selectedId = null;
+            disconnectSingleStream();
+            streamImg.style.display = 'none';
+            noCam.textContent = 'No camera selected.';
             noCam.style.display = 'flex';
             renderButton();
             renderMenu();
           }
         } else {
           renderButton();
-          renderMenu();
+          if (!picker.classList.contains('open')) renderMenu();
+          syncStreamConnections();
         }
       }
 
       function refreshMetrics() {
-        if (selectedId == null) return;
+        if (feedMode !== 'single' || selectedId == null) return;
         const cid = selectedId;
         fetch('/metrics?camera_id=' + cid)
           .then(r => r.json())
           .then(d => {
-            if (cid !== selectedId) return;
+            if (feedMode !== 'single' || cid !== selectedId) return;
             const delay = document.getElementById('delay');
             delay.textContent = '--';
             delay.className = 'value none';
@@ -1346,7 +1801,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
             if (cam && cam.stream_active !== d.stream_active) {
               cam.stream_active = d.stream_active;
               renderButton();
-              renderMenu();
+              if (!picker.classList.contains('open')) renderMenu();
+              syncSingleStream();
             }
           })
           .catch(() => {});
@@ -1358,12 +1814,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
       }
 
       function refreshLog() {
-        if (selectedId == null) return;
+        if (feedMode !== 'single' || selectedId == null) return;
         const cid = selectedId;
         fetch('/log?camera_id=' + cid)
           .then(r => r.json())
           .then(entries => {
-            if (cid !== selectedId) return;
+            if (feedMode !== 'single' || cid !== selectedId) return;
             const box = document.getElementById('log-box');
             if (!entries.length) {
               box.innerHTML = '<div class="empty">No events yet.</div>';
@@ -1434,7 +1890,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       }
 
       document.getElementById('log-clear-btn').addEventListener('click', () => {
-        if (selectedId == null) return;
+        if (feedMode !== 'single' || selectedId == null) return;
         fetch('/log/clear?camera_id=' + selectedId, { method: 'POST' })
           .then(() => refreshLog())
           .catch(() => {});
@@ -1451,12 +1907,23 @@ INDEX_HTML = r"""<!DOCTYPE html>
       });
 
       window.addEventListener('hashchange', () => {
-        const id = parseUrlCamera();
-        if (id != null && id !== selectedId) selectCamera(id);
+        const selection = parseUrlSelection();
+        if (!selection) return;
+        if (selection.mode === 'grid') {
+          if (feedMode !== 'grid') selectGridView();
+        } else if (findCamera(selection.cameraId) && (feedMode !== 'single' || selection.cameraId !== selectedId)) {
+          selectCamera(selection.cameraId);
+        }
+      });
+      document.addEventListener('visibilitychange', syncStreamConnections);
+      window.addEventListener('pageshow', syncStreamConnections);
+      window.addEventListener('pagehide', () => {
+        disconnectSingleStream();
+        disconnectGridStreams();
       });
 
-      loadCameras(true);
-      setInterval(loadCameras, 3000);
+      loadCameras();
+      setInterval(loadCameras, 1000);
       setInterval(refreshMetrics, 500);
       setInterval(refreshLog, 1000);
       refreshSystemState();

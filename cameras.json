@@ -11,14 +11,14 @@
       "id": 1,
       "name": "Camera 1",
       "location": "Warehouse",
-      "pi_host": "206.87.250.86",
+      "pi_host": "172.20.10.4",
       "pi_port": 8000
     },
     {
       "id": 2,
       "name": "Camera 2",
       "location": "Pump Station",
-      "pi_host": "206.87.134.225",
+      "pi_host": "172.20.10.3",
       "pi_port": 8000
     },
     {
