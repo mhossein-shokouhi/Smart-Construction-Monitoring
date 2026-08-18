@@ -1,11 +1,10 @@
-# Smart Construction Monitoring
+# Agentic Multi-Camera Operations
 
-An AI-agent–based orchestration system for monitoring construction sites with a
-network of edge-AI smart cameras. A natural-language **supervisor agent** on the
-operator's laptop interprets high-level prompts (e.g. *"switch the front gate
-camera to surveillance mode"*) and autonomously reconfigures a fleet of
-Raspberry Pi–backed cameras in real time. Video is streamed back to the laptop
-and displayed in a single, elegant dashboard.
+An AI-agent–based orchestration system for coordinating a network of edge-AI
+smart cameras. A natural-language **supervisor agent** on the operator's laptop
+interprets high-level objectives, selects a fleet-wide operational mode, and
+reconfigures Raspberry Pi–backed cameras in real time. Video is streamed back
+to the laptop and displayed in a single dashboard.
 
 ---
 
@@ -24,8 +23,8 @@ and displayed in a single, elegant dashboard.
  └────────────────────────────┘                           └─────────────────────────────┘
 ```
 
-1. The operator types a natural-language command into the **supervisor** UI on
-   the laptop.
+1. The operator gives the **supervisor** a natural-language objective or camera
+   command from the laptop UI.
 2. The supervisor (GPT-backed) decides what to do and calls the correct
    Raspberry Pi over HTTP using the camera registry in `cameras.json`.
 3. The Pi's **agent actuator** starts the appropriate camera pipeline:
@@ -48,7 +47,9 @@ case, Rogers 5G).
 | Path | Role |
 | --- | --- |
 | `supervisor.py` | LLM supervisor agent + Gradio UI (runs on the laptop) |
-| `emergency_vlm.py` | Laptop-side emergency scanner that samples active streams and queries the VLM |
+| `search_vlm.py` | Laptop-side Search Mode scanner that samples active streams and queries the VLM |
+| `safety_vlm.py` | Laptop-side Safety Mode scanner that evaluates each sampled frame against all applicable construction hazards in one VLM request |
+| `reporting.py` | Passive hourly snapshot recorder plus on-demand temporal VLM analysis and PDF report generation |
 | `stream_receiver_server.py` | Receives streams from all Pis and serves the dashboard (runs on the laptop) |
 | `agent_actuator.py` | FastAPI service that runs on each Raspberry Pi |
 | `raw_stream_demo.py` | Default-mode pipeline (raw Picamera2 stream, no inference overlays) |
@@ -107,8 +108,8 @@ keep them in sync.
 Clone the repo onto the Pi and install its dependencies:
 
 ```bash
-git clone https://github.com/<your-username>/Smart-Construction-Monitoring.git
-cd Smart-Construction-Monitoring
+git clone https://github.com/<your-username>/<your-repository>.git
+cd <your-repository>
 pip install -r requirements-pi.txt
 ```
 
@@ -182,8 +183,14 @@ the supervisor in plain English:
 - *"Switch the warehouse camera to construction mode."*
 - *"What is camera 1 currently doing?"*
 - *"Set all cameras to idle."*
-- *"Emergency: find the missing worker in a red hard hat and yellow vest."*
-- *"Clear the emergency; the worker has been found."*
+- *"Enter Search Mode and find a red fire extinguisher."*
+- *"Search all cameras for a child wearing a blue jacket."*
+- *"Stop Search Mode and return to Free Mode."*
+- *"Enter Safety Mode."*
+- *"Is the construction site currently clear?"*
+- *"Clear the safety hazard; the area has been inspected."*
+- *"Generate today's construction progress report. Our goal was to excavate and level Area B."*
+- *"How many reporting snapshots were captured for August 18?"*
 
 The supervisor translates each request into the right HTTP call to the
 corresponding Pi, reports back in natural language, and the dashboard updates
@@ -198,11 +205,15 @@ microphone access, and speak commands such as:
 - *"Switch the front gate camera to default mode."*
 - *"What cameras are available?"*
 - *"Set the front gate camera back to idle."*
+- *"Enter Search Mode and find the red fire extinguisher."*
+- *"Generate today's construction progress report."*
+- *"Switch to Investigation Mode."*
 
 Voice chat uses OpenAI's Realtime API over WebRTC. The browser sends microphone
 audio directly through a peer connection and receives natural spoken audio back;
-`supervisor.py` only performs the secure session handshake and executes camera
-tool calls, so your standard `OPENAI_API_KEY` is never exposed to the browser.
+`supervisor.py` only performs the secure session handshake and executes
+supervisor tool calls, so your standard `OPENAI_API_KEY` is never exposed to
+the browser.
 
 Optional voice settings:
 
@@ -210,10 +221,28 @@ Optional voice settings:
 | --- | --- | --- |
 | `OPENAI_REALTIME_MODEL` | `gpt-realtime` | Realtime speech-to-speech model used by the voice agent. Use `gpt-realtime-2` if it is enabled for your OpenAI project. |
 | `OPENAI_REALTIME_VOICE` | `marin` | Spoken voice returned by the Realtime model |
-| `OPENAI_EMERGENCY_VLM_MODEL` | `gpt-5.5` | Vision-capable model used by the laptop-side emergency scanner |
-| `OPENAI_EMERGENCY_VLM_DETAIL` | `high` | Image detail sent to the emergency VLM (`low`, `high`, or `auto`) |
-| `EMERGENCY_MATCH_THRESHOLD` | `0.75` | Minimum VLM confidence required before the dashboard raises an alert |
+| `OPENAI_SEARCH_VLM_MODEL` | `gpt-5.5` | Vision-capable model used by the laptop-side Search scanner |
+| `OPENAI_SEARCH_VLM_DETAIL` | `high` | Image detail sent to the Search VLM (`low`, `high`, or `auto`) |
+| `SEARCH_MATCH_THRESHOLD` | `0.75` | Minimum VLM confidence required before the dashboard raises a Search match alert |
+| `OPENAI_SAFETY_VLM_MODEL` | Search model value | Vision-capable model used by the Safety scanner |
+| `OPENAI_SAFETY_VLM_DETAIL` | Search detail value | Image detail sent to the Safety VLM (`low`, `high`, or `auto`) |
+| `SAFETY_MATCH_THRESHOLD` | `0.75` | Minimum confidence required before a Safety hazard is latched and displayed |
+| `SAFETY_SITE_TIMEZONE` | `America/Vancouver` | IANA site timezone used for the after-hours access rule |
+| `SAFETY_ACCESS_START_HOUR` | `9` | First permitted construction-hour clock hour, inclusive |
+| `SAFETY_ACCESS_END_HOUR` | `17` | End of permitted construction hours; this hour is after-hours |
+| `OPENAI_REPORTING_VLM_MODEL` | `gpt-5.6` | Vision-capable model used for per-camera timeline analysis and final report synthesis |
+| `OPENAI_REPORTING_VLM_DETAIL` | `high` | Image detail sent for daily report analysis |
+| `OPENAI_REPORTING_REASONING_EFFORT` | `medium` | Reasoning effort used by both reporting model stages |
+| `REPORTING_SITE_TIMEZONE` | Safety timezone value | IANA timezone used to assign hourly snapshots to a site-local day |
+| `REPORTING_CAPTURE_START_HOUR` | `9` | First hourly report snapshot, inclusive |
+| `REPORTING_CAPTURE_END_HOUR` | `17` | Last hourly report snapshot, inclusive |
+| `REPORTING_CAPTURE_POLL_SEC` | `30` | How often the recorder retries a missing camera within the current hourly slot |
+| `REPORTING_MAX_FRAME_AGE_SEC` | `10` | Maximum age of a receiver frame accepted as hourly evidence |
+| `REPORTING_MAX_ANALYSIS_WORKERS` | `2` | Maximum camera timelines analyzed concurrently |
+| `REPORTING_SNAPSHOT_DIR` | OS temporary directory | Optional directory for timestamped hourly JPEG evidence and metadata |
+| `REPORTING_OUTPUT_DIR` | `output/pdf` | Directory for generated daily PDF reports |
 | `STREAM_RECEIVER_URL` | `http://127.0.0.1:9000` | Receiver URL used by the supervisor to read active streams and publish system logs |
+| `OPERATIONAL_STATE_PUBLISH_INTERVAL_SEC` | `2.0` | How often the supervisor republishes operational state so the receiver can recover after a restart |
 
 Microphone access works on `localhost` / `127.0.0.1` in modern browsers. If you
 open the supervisor from another device, serve it over HTTPS so the browser will
@@ -221,7 +250,7 @@ allow microphone capture.
 
 ---
 
-## Operational modes
+## Camera processing modes
 
 | Mode | What runs on the Pi | Typical use |
 | --- | --- | --- |
@@ -233,20 +262,93 @@ allow microphone capture.
 All modes are selectable from the supervisor prompt — you never need to
 SSH into a Pi to change them.
 
-## Agentic modes
+## Fleet-wide operational modes
 
 | Mode | Behaviour |
 | --- | --- |
-| `free` | Default state. Each camera can be controlled independently through the supervisor. |
-| `emergency` | Activated when the operator reports an emergency or asks the supervisor to search for a missing person / person of interest. The supervisor commands every reachable camera into `default` mode and starts `emergency_vlm.py` on the laptop. |
+| `free` | Initial live-view mode. Stops Search and Safety scanning and sets every reachable camera to raw `default` streaming without running an automated scanner or workflow. A previously latched safety hazard remains visible until explicitly cleared. |
+| `safety` | Configures every reachable camera for raw `default` streaming and continuously checks each sampled frame for the applicable construction safety hazards in one VLM request. |
+| `search` | Configures every reachable camera for raw `default` streaming and scans all active feeds for the operator's visual target. The target can be a person, animal, vehicle, piece of equipment, or any other visibly identifiable object. |
+| `investigation` | Selectable placeholder. Its investigation workflow will be added when requirements are finalized. |
 
-While Emergency mode is active, the scanner asks the receiver which streams are
-currently live, samples one latest frame per active camera on each pass, and
-sends those frames to the configured VLM with the operator's visual-search
-intent. Camera feeds remain visible in the receiver dashboard. The dashboard now
-includes a **System Logs** tab; when the VLM reports a match above the configured
-threshold, that tab records a bold alert, stores the triggering frame, and plays
-an alarm sound in the browser.
+Search Mode reuses the proven fleet-wide visual-search workflow. The scanner
+asks the receiver which streams are live, samples the latest frame from each
+active camera on every pass, and sends those frames to the configured VLM with
+the operator's target description. Camera feeds remain visible in the receiver
+dashboard. When the VLM reports a match above the configured threshold, the
+**System Logs** tab records a highlighted match, stores the triggering frame,
+and plays an alarm sound in the browser. Search Mode and match indicators use
+neutral blue/teal styling instead of critical-state red.
+
+Safety Mode uses the same fleet-wide stream sampling foundation but evaluates
+exactly two applicable safety checks together. During configured construction
+hours, each frame is assessed for:
+
+- **Fire Hazard** — visible flame, fire, or smoke.
+- **Work-Zone Intrusion** — a person, animal, or other living creature
+  visibly present in an active machinery work zone.
+
+Outside the configured 09:00–17:00 site-local window, the laptop performs a
+local clock check. Machinery is considered off, so **Work-Zone Intrusion** is
+replaced by **Unauthorized Entry**, which checks for a person present at the
+site. **Fire Hazard** remains active at all times. This decision is made
+in-process before the VLM request, so every frame still uses one model call.
+The full camera view is treated as the monitored work zone/site in the current
+demo.
+
+A single frame can trigger multiple hazards. Each positive assessment above the
+configured confidence threshold produces a red **STOP WORK** alert with its
+cause and triggering frame. The receiver separately
+latches the construction safety state red, and that state remains red even if
+the operator switches modes or clears the System Log. It returns to green only
+when the operator explicitly asks the supervisor to clear or acknowledge the
+safety state. A new visible hazard can latch it red again.
+
+The system starts in Free Mode. Entering Free Mode stops any active Search or Safety scan,
+clears its objective, and normalizes all registered cameras to `default`
+processing for an unprocessed fleet-wide footage view. It does not run a VLM
+scanner or any other operational workflow, and it does not silently clear a
+latched construction hazard.
+
+Investigation is intentionally an honest placeholder: selecting it updates the
+operational state and stops any active Search or Safety scan, but does not invent
+or apply camera configuration until that mode's detailed requirements are
+defined. Per-camera processing modes remain independently available whenever
+neither Search nor Safety Mode is active.
+
+## Daily construction reporting
+
+Reporting is a background capability, not an operational mode. It does not stop
+Search or Safety, change the current operational state, or reconfigure a Pi. While
+the supervisor is running, it reads the receiver's latest fresh frame and saves
+one timestamped JPEG per registered camera for every hourly slot from 09:00
+through 17:00 in the configured site timezone. If a camera is unavailable or its
+frame is stale, the recorder retries during that same hour. Each camera and hour
+is stored only once. The evidence is placed under the operating system's temporary
+directory by default; use `REPORTING_SNAPSHOT_DIR` to choose another location.
+
+When the operator asks for a report for a date, the system uses a compact two-stage
+analysis:
+
+1. Each camera's ordered snapshots are sent together in one multimodal VLM request,
+   with the camera name and capture time immediately before each image. The model
+   returns structured activities, visible changes, progress estimates, issues, and
+   confidence for that camera.
+2. One text-only synthesis request combines those camera observations, removes
+   duplicate views of the same work, and creates the site-wide narrative. The
+   laptop then lays out a downloadable PDF with the summary, timeline, issues,
+   evidence coverage, and representative first/last frames.
+
+This gives the VLM temporal context without one enormous all-camera image request
+and avoids maintaining a separate always-running progress database. The structured
+observations are working context for the requested report rather than long-term
+agent memory. If the operator includes the day's goal, the report can estimate
+progress toward it. Without a goal, the prompt explicitly prevents an invented
+completion percentage and reports only visible activity and change.
+
+Generated PDFs are saved under `output/pdf` and served from the supervisor at
+`/reports/<filename>`. A report can be requested while any operational mode is
+active.
 
 ---
 

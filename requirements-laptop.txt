@@ -2,7 +2,8 @@
 # Install with: pip install -r requirements-laptop.txt
 
 gradio>=4.0
-openai>=1.40
+openai>=1.70
 requests>=2.31
 fastapi>=0.110
 uvicorn[standard]>=0.27
+reportlab>=4.0

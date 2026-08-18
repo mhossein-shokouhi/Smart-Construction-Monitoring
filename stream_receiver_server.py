@@ -37,15 +37,26 @@ _metrics_history = {}  # camera_id -> list of (receive_time, capture_time), max 
 _stream_was_active = {}  # camera_id -> bool
 # Per-camera event log: list of { "time": unix_ts, "message": str }
 _event_log = {}  # camera_id -> list, max MAX_LOG_ENTRIES
-# Global system log and alert-frame cache for supervisor/emergency activity.
+# Global system log and alert-frame cache for supervisor operational activity.
 _system_log = []
 _alert_frames = {}
 _next_system_event_id = 1
+OPERATIONAL_MODES = {"free", "safety", "search", "investigation"}
+PLACEHOLDER_OPERATIONAL_MODES = {"investigation"}
+SAFETY_HAZARD_NAMES = {
+    "fire_smoke": "Fire Hazard",
+    "work_zone_encroachment": "Work-Zone Intrusion",
+    "after_hours_intrusion": "Unauthorized Entry",
+}
 _system_state = {
     "mode": "free",
-    "emergency_intent": None,
+    "objective": None,
     "scanner_running": False,
+    "placeholder": False,
     "updated_at": None,
+    "safety_status": "clear",
+    "active_safety_hazards": [],
+    "safety_updated_at": None,
 }
 _lock = threading.Lock()
 MJPEG_BOUNDARY = "frame"
@@ -128,6 +139,11 @@ def _log_system_event(payload: dict) -> dict:
             entry["confidence"] = round(float(confidence), 3)
         except (TypeError, ValueError):
             pass
+
+    for field in ("hazard_key", "hazard_name", "cause", "reason"):
+        value = payload.get(field)
+        if value is not None:
+            entry[field] = str(value)
 
     frame_b64 = payload.get("frame_jpeg_b64")
     if frame_b64:
@@ -273,10 +289,18 @@ async def latest_frame(camera_id: int):
     )
 
 
+def _system_state_copy_locked() -> dict:
+    state = dict(_system_state)
+    state["active_safety_hazards"] = [
+        dict(hazard) for hazard in _system_state.get("active_safety_hazards") or []
+    ]
+    return state
+
+
 @app.get("/system/state")
 async def get_system_state():
     with _lock:
-        state = dict(_system_state)
+        state = _system_state_copy_locked()
     return JSONResponse(state)
 
 
@@ -287,13 +311,120 @@ async def update_system_state(request: Request):
     except Exception:
         return JSONResponse({"status": "error", "error": "Request body must be JSON."}, status_code=400)
 
+    mode = str(payload.get("mode") or "free").strip().lower()
+    if mode not in OPERATIONAL_MODES:
+        return JSONResponse(
+            {
+                "status": "error",
+                "error": f"Unknown operational mode: {mode}",
+            },
+            status_code=400,
+        )
+
+    objective = payload.get("objective")
+    if objective is not None:
+        objective = str(objective).strip() or None
+    if mode in {"free", "safety"}:
+        objective = None
+
     with _lock:
-        _system_state["mode"] = str(payload.get("mode") or "free")
-        _system_state["emergency_intent"] = payload.get("emergency_intent")
-        _system_state["scanner_running"] = bool(payload.get("scanner_running"))
+        _system_state["mode"] = mode
+        _system_state["objective"] = objective
+        _system_state["scanner_running"] = (
+            bool(payload.get("scanner_running")) if mode in {"search", "safety"} else False
+        )
+        _system_state["placeholder"] = mode in PLACEHOLDER_OPERATIONAL_MODES
         _system_state["updated_at"] = time.time()
-        state = dict(_system_state)
+        state = _system_state_copy_locked()
     return JSONResponse({"status": "ok", "state": state})
+
+
+@app.post("/system/safety/hazard")
+async def latch_safety_hazard(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"status": "error", "error": "Request body must be JSON."}, status_code=400)
+
+    hazard_key = str(payload.get("hazard_key") or "").strip()
+    hazard_name = SAFETY_HAZARD_NAMES.get(hazard_key)
+    if hazard_name is None:
+        return JSONResponse(
+            {"status": "error", "error": f"Unknown safety hazard: {hazard_key}"},
+            status_code=400,
+        )
+    try:
+        camera_id = int(payload["camera_id"])
+    except (KeyError, TypeError, ValueError):
+        return JSONResponse(
+            {"status": "error", "error": "camera_id must be an integer."},
+            status_code=400,
+        )
+
+    cause = str(payload.get("cause") or "").strip() or "Visible evidence triggered this safety check."
+    message = f"STOP WORK — {hazard_name} on camera {camera_id}: {cause}"
+    now = time.time()
+    event_payload = {
+        "kind": "safety_alert",
+        "level": "critical",
+        "message": message,
+        "hazard_key": hazard_key,
+        "hazard_name": hazard_name,
+        "cause": cause,
+        "camera_id": camera_id,
+        "confidence": payload.get("confidence"),
+        "frame_jpeg_b64": payload.get("frame_jpeg_b64"),
+    }
+
+    with _lock:
+        event = _log_system_event(event_payload)
+        hazard = {
+            "hazard_key": hazard_key,
+            "hazard_name": hazard_name,
+            "cause": cause,
+            "camera_id": camera_id,
+            "confidence": event.get("confidence"),
+            "detected_at": now,
+            "event_id": event["id"],
+        }
+        active = [
+            item
+            for item in _system_state.get("active_safety_hazards") or []
+            if not (
+                item.get("hazard_key") == hazard_key
+                and item.get("camera_id") == camera_id
+            )
+        ]
+        active.append(hazard)
+        _system_state["active_safety_hazards"] = active[-50:]
+        _system_state["safety_status"] = "hazard"
+        _system_state["safety_updated_at"] = now
+        state = _system_state_copy_locked()
+    return JSONResponse({"status": "ok", "event": event, "state": state})
+
+
+@app.post("/system/safety/clear")
+async def clear_safety_hazard_state(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    reason = str(payload.get("reason") or "").strip() or "Cleared explicitly by the operator."
+    now = time.time()
+    with _lock:
+        _system_state["safety_status"] = "clear"
+        _system_state["active_safety_hazards"] = []
+        _system_state["safety_updated_at"] = now
+        event = _log_system_event(
+            {
+                "kind": "safety_clear",
+                "level": "info",
+                "message": f"Construction safety state cleared by operator. {reason}",
+                "reason": reason,
+            }
+        )
+        state = _system_state_copy_locked()
+    return JSONResponse({"status": "ok", "event": event, "state": state})
 
 
 @app.get("/system/log")
@@ -1036,7 +1167,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     }
     .system-overview {
       display: grid;
-      grid-template-columns: 180px 1fr 180px;
+      grid-template-columns: 160px minmax(180px, 1fr) 160px minmax(260px, 1.2fr);
       gap: 12px;
     }
     .system-stat {
@@ -1059,10 +1190,33 @@ INDEX_HTML = r"""<!DOCTYPE html>
       font-weight: 700;
       color: var(--text);
     }
-    .system-stat .value.emergency {
-      color: #ff8d8d;
+    .system-stat .value.search {
+      color: #7dd3fc;
     }
-    .system-stat.intent .value {
+    .system-stat .value.safety-clear {
+      color: #67e8a5;
+    }
+    .system-stat .value.safety-hazard {
+      color: #ff6b6b;
+    }
+    .system-stat.safety-state {
+      transition: border-color 0.2s, background 0.2s, box-shadow 0.2s;
+    }
+    .system-overview.hazard .system-stat.safety-state {
+      border-color: rgba(239, 68, 68, 0.72);
+      background: linear-gradient(135deg, rgba(127, 29, 29, 0.44), rgba(69, 10, 10, 0.24));
+      box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.15), 0 10px 30px rgba(127, 29, 29, 0.2);
+    }
+    .safety-detail {
+      margin-top: 7px;
+      color: var(--text-muted);
+      font-size: 0.75rem;
+      line-height: 1.35;
+    }
+    .system-overview.hazard .safety-detail {
+      color: #fecaca;
+    }
+    .system-stat.objective .value {
       font-size: 0.9375rem;
       font-weight: 500;
       line-height: 1.4;
@@ -1138,13 +1292,34 @@ INDEX_HTML = r"""<!DOCTYPE html>
       line-height: 1.45;
     }
     .system-entry.alert .badge {
-      color: #ff8d8d;
-      border-color: rgba(239, 68, 68, 0.45);
-      background: rgba(239, 68, 68, 0.14);
+      color: #7dd3fc;
+      border-color: rgba(56, 189, 248, 0.42);
+      background: rgba(56, 189, 248, 0.14);
     }
     .system-entry.alert .content strong {
       color: #fff;
       font-weight: 700;
+    }
+    .system-entry.safety-alert {
+      margin: 8px 0;
+      padding: 14px 12px;
+      border: 1px solid rgba(239, 68, 68, 0.5);
+      border-radius: 8px;
+      background: linear-gradient(135deg, rgba(127, 29, 29, 0.4), rgba(69, 10, 10, 0.16));
+    }
+    .system-entry.safety-alert .badge {
+      color: #fff;
+      border-color: rgba(248, 113, 113, 0.75);
+      background: #b91c1c;
+    }
+    .system-entry.safety-alert .content strong {
+      color: #fecaca;
+      font-weight: 800;
+    }
+    .system-entry.safety-clear .badge {
+      color: #67e8a5;
+      border-color: rgba(52, 211, 153, 0.4);
+      background: rgba(16, 185, 129, 0.12);
     }
     .system-entry.warning .badge {
       color: #ffd166;
@@ -1263,18 +1438,23 @@ INDEX_HTML = r"""<!DOCTYPE html>
   </section>
   <section class="tab-view" id="system-view">
     <div class="system-view-shell">
-      <div class="system-overview">
+      <div class="system-overview" id="system-overview">
         <div class="system-stat">
-          <div class="label">Agentic mode</div>
+          <div class="label">Operational mode</div>
           <div class="value" id="system-mode-value">Free</div>
         </div>
-        <div class="system-stat intent">
-          <div class="label">Emergency intent</div>
-          <div class="value" id="system-intent-value">None</div>
+        <div class="system-stat objective">
+          <div class="label">Mode objective</div>
+          <div class="value" id="system-objective-value">None</div>
         </div>
         <div class="system-stat">
-          <div class="label">VLM scanner</div>
-          <div class="value" id="system-scanner-value">Idle</div>
+          <div class="label">Mode status</div>
+          <div class="value" id="system-status-value">No workflow</div>
+        </div>
+        <div class="system-stat safety-state">
+          <div class="label">Construction safety</div>
+          <div class="value safety-clear" id="system-safety-value">Clear for construction</div>
+          <div class="safety-detail" id="system-safety-detail">No active safety hazards.</div>
         </div>
       </div>
       <div class="system-log">
@@ -1314,8 +1494,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
       const cameraGrid = document.getElementById('camera-grid');
       const viewTabs = Array.from(document.querySelectorAll('.view-tab'));
       const systemModeValue = document.getElementById('system-mode-value');
-      const systemIntentValue = document.getElementById('system-intent-value');
-      const systemScannerValue = document.getElementById('system-scanner-value');
+      const systemObjectiveValue = document.getElementById('system-objective-value');
+      const systemStatusValue = document.getElementById('system-status-value');
+      const systemOverview = document.getElementById('system-overview');
+      const systemSafetyValue = document.getElementById('system-safety-value');
+      const systemSafetyDetail = document.getElementById('system-safety-detail');
       const systemLogList = document.getElementById('system-log-list');
       let systemLogInitialized = false;
       let lastAlertEventId = 0;
@@ -1838,14 +2021,24 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
       function renderSystemEntry(entry) {
         const level = entry.level || 'info';
-        const isAlert = entry.kind === 'alert';
-        const rowClass = 'system-entry' + (isAlert ? ' alert' : (level === 'warning' ? ' warning' : ''));
-        const label = isAlert ? 'Alert' : (level === 'warning' ? 'Warning' : (entry.kind || 'System'));
-        const body = isAlert
+        const isSearchAlert = entry.kind === 'alert';
+        const isSafetyAlert = entry.kind === 'safety_alert';
+        const isSafetyClear = entry.kind === 'safety_clear';
+        const rowClass = 'system-entry' + (
+          isSafetyAlert ? ' safety-alert' : (
+            isSearchAlert ? ' alert' : (
+              isSafetyClear ? ' safety-clear' : (level === 'warning' ? ' warning' : '')
+            )
+          )
+        );
+        const label = isSafetyAlert
+          ? 'Stop work'
+          : (isSearchAlert ? 'Match' : (isSafetyClear ? 'Clear' : (level === 'warning' ? 'Warning' : (entry.kind || 'System'))));
+        const body = (isSearchAlert || isSafetyAlert)
           ? '<strong>' + escapeHtml(entry.message || '') + '</strong>'
           : escapeHtml(entry.message || '');
         const frame = entry.frame_url
-          ? '<img src="' + escapeHtml(entry.frame_url) + '" alt="Alert frame" loading="lazy">'
+          ? '<img src="' + escapeHtml(entry.frame_url) + '" alt="' + (isSafetyAlert ? 'Safety hazard frame' : 'Search match frame') + '" loading="lazy">'
           : '';
         return (
           '<div class="' + rowClass + '">' +
@@ -1860,11 +2053,30 @@ INDEX_HTML = r"""<!DOCTYPE html>
         fetch('/system/state')
           .then(r => r.json())
           .then(state => {
-            const emergency = state.mode === 'emergency';
-            systemModeValue.textContent = emergency ? 'Emergency' : 'Free';
-            systemModeValue.className = 'value' + (emergency ? ' emergency' : '');
-            systemIntentValue.textContent = state.emergency_intent || 'None';
-            systemScannerValue.textContent = state.scanner_running ? 'Scanning' : 'Idle';
+            const knownModes = ['free', 'safety', 'search', 'investigation'];
+            const mode = knownModes.includes(state.mode) ? state.mode : 'free';
+            systemModeValue.textContent = mode.charAt(0).toUpperCase() + mode.slice(1);
+            systemModeValue.className = 'value' + (mode === 'search' ? ' search' : '');
+            systemObjectiveValue.textContent = state.objective || 'None';
+            systemStatusValue.textContent = (mode === 'search' || mode === 'safety')
+              ? (state.scanner_running ? 'Scanning' : 'Scanner stopped')
+              : (mode === 'free' ? 'No workflow' : 'Placeholder');
+
+            const safetyHazard = state.safety_status === 'hazard';
+            const activeHazards = Array.isArray(state.active_safety_hazards)
+              ? state.active_safety_hazards
+              : [];
+            systemOverview.classList.toggle('hazard', safetyHazard);
+            systemSafetyValue.textContent = safetyHazard ? 'STOP WORK — Hazard active' : 'Clear for construction';
+            systemSafetyValue.className = 'value ' + (safetyHazard ? 'safety-hazard' : 'safety-clear');
+            if (safetyHazard && activeHazards.length) {
+              const names = [...new Set(activeHazards.map(item => item.hazard_name).filter(Boolean))];
+              systemSafetyDetail.textContent = names.join(' · ') || 'Operator clearance required.';
+            } else {
+              systemSafetyDetail.textContent = safetyHazard
+                ? 'Operator clearance required.'
+                : 'No active safety hazards.';
+            }
           })
           .catch(() => {});
       }
@@ -1873,7 +2085,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         fetch('/system/log')
           .then(r => r.json())
           .then(entries => {
-            const alerts = entries.filter(entry => entry.kind === 'alert');
+            const alerts = entries.filter(entry => entry.kind === 'alert' || entry.kind === 'safety_alert');
             const newestAlertId = alerts.reduce((maxId, entry) => Math.max(maxId, entry.id || 0), 0);
             if (systemLogInitialized && newestAlertId > lastAlertEventId) playAlarm();
             lastAlertEventId = Math.max(lastAlertEventId, newestAlertId);

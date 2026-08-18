@@ -5,17 +5,20 @@ import html
 import json
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 import gradio as gr
 import requests
 from openai import OpenAI
 
-from emergency_vlm import EmergencyScanner
+from safety_vlm import SafetyScanner
+from search_vlm import SearchScanner
+from reporting import ConstructionReporting
 
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
@@ -26,9 +29,50 @@ REALTIME_VOICE = os.environ.get("OPENAI_REALTIME_VOICE", "marin")
 REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls"
 SUPERVISOR_MODEL = os.environ.get("OPENAI_SUPERVISOR_MODEL", "gpt-5-mini")
 STREAM_RECEIVER_URL = os.environ.get("STREAM_RECEIVER_URL", "http://127.0.0.1:9000").rstrip("/")
-EMERGENCY_VLM_MODEL = os.environ.get("OPENAI_EMERGENCY_VLM_MODEL", "gpt-5.5")
-EMERGENCY_VLM_DETAIL = os.environ.get("OPENAI_EMERGENCY_VLM_DETAIL", "high")
-EMERGENCY_MATCH_THRESHOLD = float(os.environ.get("EMERGENCY_MATCH_THRESHOLD", "0.75"))
+SEARCH_VLM_MODEL = os.environ.get(
+    "OPENAI_SEARCH_VLM_MODEL",
+    os.environ.get("OPENAI_EMERGENCY_VLM_MODEL", "gpt-5.5"),
+)
+SEARCH_VLM_DETAIL = os.environ.get(
+    "OPENAI_SEARCH_VLM_DETAIL",
+    os.environ.get("OPENAI_EMERGENCY_VLM_DETAIL", "high"),
+)
+SEARCH_MATCH_THRESHOLD = float(
+    os.environ.get(
+        "SEARCH_MATCH_THRESHOLD",
+        os.environ.get("EMERGENCY_MATCH_THRESHOLD", "0.75"),
+    )
+)
+SAFETY_VLM_MODEL = os.environ.get("OPENAI_SAFETY_VLM_MODEL", SEARCH_VLM_MODEL)
+SAFETY_VLM_DETAIL = os.environ.get("OPENAI_SAFETY_VLM_DETAIL", SEARCH_VLM_DETAIL)
+SAFETY_MATCH_THRESHOLD = float(os.environ.get("SAFETY_MATCH_THRESHOLD", "0.75"))
+SAFETY_SITE_TIMEZONE = os.environ.get("SAFETY_SITE_TIMEZONE", "America/Vancouver")
+SAFETY_ACCESS_START_HOUR = int(os.environ.get("SAFETY_ACCESS_START_HOUR", "9"))
+SAFETY_ACCESS_END_HOUR = int(os.environ.get("SAFETY_ACCESS_END_HOUR", "17"))
+REPORTING_VLM_MODEL = os.environ.get("OPENAI_REPORTING_VLM_MODEL", "gpt-5.6")
+REPORTING_VLM_DETAIL = os.environ.get("OPENAI_REPORTING_VLM_DETAIL", "high")
+REPORTING_REASONING_EFFORT = os.environ.get("OPENAI_REPORTING_REASONING_EFFORT", "medium")
+REPORTING_SITE_TIMEZONE = os.environ.get("REPORTING_SITE_TIMEZONE", SAFETY_SITE_TIMEZONE)
+REPORTING_CAPTURE_START_HOUR = int(os.environ.get("REPORTING_CAPTURE_START_HOUR", "9"))
+REPORTING_CAPTURE_END_HOUR = int(os.environ.get("REPORTING_CAPTURE_END_HOUR", "17"))
+REPORTING_CAPTURE_POLL_SEC = max(
+    1.0,
+    float(os.environ.get("REPORTING_CAPTURE_POLL_SEC", "30")),
+)
+REPORTING_MAX_FRAME_AGE_SEC = max(
+    1.0,
+    float(os.environ.get("REPORTING_MAX_FRAME_AGE_SEC", "10")),
+)
+REPORTING_MAX_ANALYSIS_WORKERS = max(
+    1,
+    int(os.environ.get("REPORTING_MAX_ANALYSIS_WORKERS", "2")),
+)
+REPORTING_SNAPSHOT_DIR = os.environ.get("REPORTING_SNAPSHOT_DIR") or None
+REPORTING_OUTPUT_DIR = os.environ.get("REPORTING_OUTPUT_DIR") or None
+OPERATIONAL_STATE_PUBLISH_INTERVAL_SEC = max(
+    0.5,
+    float(os.environ.get("OPERATIONAL_STATE_PUBLISH_INTERVAL_SEC", "2.0")),
+)
 MAX_TOOL_ROUNDS = 6
 
 
@@ -55,20 +99,36 @@ def load_cameras() -> dict:
 
 
 CAMERAS = load_cameras()
-AGENTIC_MODE_FREE = "free"
-AGENTIC_MODE_EMERGENCY = "emergency"
-_agentic_lock = threading.Lock()
-_agentic_state = {
-    "mode": AGENTIC_MODE_FREE,
-    "emergency_intent": None,
+OPERATIONAL_MODES = {"free", "safety", "search", "investigation"}
+PLACEHOLDER_OPERATIONAL_MODES = {"investigation"}
+_orchestration_lock = threading.RLock()
+_operational_lock = threading.Lock()
+_state_publisher_lock = threading.Lock()
+_state_publisher_started = False
+_startup_mode_lock = threading.Lock()
+_startup_mode_initialized = False
+_operational_state = {
+    "mode": "free",
+    "objective": None,
 }
-emergency_scanner = EmergencyScanner(
+search_scanner = SearchScanner(
     client=client,
     receiver_url=STREAM_RECEIVER_URL,
-    model=EMERGENCY_VLM_MODEL,
-    image_detail=EMERGENCY_VLM_DETAIL,
-    match_threshold=EMERGENCY_MATCH_THRESHOLD,
+    model=SEARCH_VLM_MODEL,
+    image_detail=SEARCH_VLM_DETAIL,
+    match_threshold=SEARCH_MATCH_THRESHOLD,
     max_workers=max(4, len(CAMERAS) or 1),
+)
+safety_scanner = SafetyScanner(
+    client=client,
+    receiver_url=STREAM_RECEIVER_URL,
+    model=SAFETY_VLM_MODEL,
+    image_detail=SAFETY_VLM_DETAIL,
+    match_threshold=SAFETY_MATCH_THRESHOLD,
+    max_workers=max(4, len(CAMERAS) or 1),
+    site_timezone=SAFETY_SITE_TIMEZONE,
+    access_start_hour=SAFETY_ACCESS_START_HOUR,
+    access_end_hour=SAFETY_ACCESS_END_HOUR,
 )
 
 
@@ -133,21 +193,74 @@ def list_cameras_tool() -> dict:
     }
 
 
-def _post_receiver_json(path: str, payload: dict) -> None:
+def _post_receiver_json(path: str, payload: dict) -> bool:
     try:
-        requests.post(f"{STREAM_RECEIVER_URL}{path}", json=payload, timeout=2)
+        response = requests.post(f"{STREAM_RECEIVER_URL}{path}", json=payload, timeout=2)
+        response.raise_for_status()
+        return True
     except Exception:
-        pass
+        return False
 
 
-def _publish_agentic_state() -> None:
-    with _agentic_lock:
-        payload = {
-            "mode": _agentic_state["mode"],
-            "emergency_intent": _agentic_state["emergency_intent"],
-            "scanner_running": emergency_scanner.is_running(),
-        }
-    _post_receiver_json("/system/state", payload)
+def _scanner_running_for_mode(mode: str) -> bool:
+    if mode == "search":
+        return search_scanner.is_running()
+    if mode == "safety":
+        return safety_scanner.is_running()
+    return False
+
+
+def _publish_operational_state() -> bool:
+    with _orchestration_lock:
+        with _operational_lock:
+            mode = _operational_state["mode"]
+            payload = {
+                "mode": mode,
+                "objective": _operational_state["objective"],
+                "scanner_running": _scanner_running_for_mode(mode),
+                "placeholder": mode in PLACEHOLDER_OPERATIONAL_MODES,
+            }
+        return _post_receiver_json("/system/state", payload)
+
+
+def _reconcile_operational_state() -> bool:
+    """Publish desired state and resume a pending scanner after receiver acknowledgement."""
+    with _orchestration_lock:
+        receiver_synced = _publish_operational_state()
+        if not receiver_synced:
+            return False
+
+        with _operational_lock:
+            mode = _operational_state["mode"]
+            objective = _operational_state["objective"]
+        if mode == "search" and objective and not search_scanner.is_running():
+            search_scanner.start(objective)
+            return _publish_operational_state()
+        if mode == "safety" and not safety_scanner.is_running():
+            safety_scanner.start()
+            return _publish_operational_state()
+        return True
+
+
+def _operational_state_publisher_loop() -> None:
+    while True:
+        _reconcile_operational_state()
+        time.sleep(OPERATIONAL_STATE_PUBLISH_INTERVAL_SEC)
+
+
+def start_operational_state_publisher() -> None:
+    """Keep the receiver synchronized if either laptop service restarts."""
+    global _state_publisher_started
+
+    with _state_publisher_lock:
+        if _state_publisher_started:
+            return
+        _state_publisher_started = True
+        threading.Thread(
+            target=_operational_state_publisher_loop,
+            name="operational-state-publisher",
+            daemon=True,
+        ).start()
 
 
 def _post_system_log(
@@ -167,6 +280,30 @@ def _post_system_log(
     _post_receiver_json("/system/log", payload)
 
 
+reporting_service = ConstructionReporting(
+    client=client,
+    receiver_url=STREAM_RECEIVER_URL,
+    cameras=CAMERAS,
+    model=REPORTING_VLM_MODEL,
+    image_detail=REPORTING_VLM_DETAIL,
+    reasoning_effort=REPORTING_REASONING_EFFORT,
+    site_timezone=REPORTING_SITE_TIMEZONE,
+    capture_start_hour=REPORTING_CAPTURE_START_HOUR,
+    capture_end_hour=REPORTING_CAPTURE_END_HOUR,
+    capture_poll_sec=REPORTING_CAPTURE_POLL_SEC,
+    max_frame_age_sec=REPORTING_MAX_FRAME_AGE_SEC,
+    max_analysis_workers=REPORTING_MAX_ANALYSIS_WORKERS,
+    snapshot_root=REPORTING_SNAPSHOT_DIR,
+    output_dir=REPORTING_OUTPUT_DIR,
+    log_callback=_post_system_log,
+)
+
+
+def start_reporting_recorder() -> None:
+    """Start passive hourly evidence capture once for the supervisor process."""
+    reporting_service.start()
+
+
 def _set_all_cameras_default() -> list[dict]:
     camera_ids = sorted(CAMERAS.keys())
     if not camera_ids:
@@ -175,35 +312,262 @@ def _set_all_cameras_default() -> list[dict]:
         return list(executor.map(lambda camera_id: call_pi_set_mode(camera_id, "default"), camera_ids))
 
 
-def get_agentic_mode_tool() -> dict:
-    with _agentic_lock:
+def get_operational_mode_tool() -> dict:
+    with _orchestration_lock:
+        with _operational_lock:
+            mode = _operational_state["mode"]
+            return {
+                "status": "ok",
+                "mode": mode,
+                "objective": _operational_state["objective"],
+                "scanner_running": _scanner_running_for_mode(mode),
+                "placeholder": mode in PLACEHOLDER_OPERATIONAL_MODES,
+            }
+
+
+def get_safety_state_tool(timeout_sec: float = 2.0) -> dict:
+    try:
+        response = requests.get(f"{STREAM_RECEIVER_URL}/system/state", timeout=timeout_sec)
+        response.raise_for_status()
+        state = response.json()
         return {
             "status": "ok",
-            "mode": _agentic_state["mode"],
-            "emergency_intent": _agentic_state["emergency_intent"],
-            "scanner_running": emergency_scanner.is_running(),
+            "safety_status": state.get("safety_status", "clear"),
+            "active_hazards": state.get("active_safety_hazards") or [],
+            "updated_at": state.get("safety_updated_at"),
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error": f"Could not read construction safety state from the receiver: {exc}",
         }
 
 
-def activate_emergency_mode(intent: str) -> dict:
-    clean_intent = str(intent or "").strip()
-    if not clean_intent:
-        return {"status": "error", "error": "Emergency intent cannot be empty."}
+def clear_safety_hazard(reason: Optional[str] = None) -> dict:
+    clean_reason = str(reason or "").strip() or "Cleared explicitly by the operator."
+    receiver_synced = _post_receiver_json(
+        "/system/safety/clear",
+        {"reason": clean_reason},
+    )
+    if not receiver_synced:
+        return {
+            "status": "error",
+            "receiver_synced": False,
+            "message": (
+                "The construction safety state could not be cleared because the receiver "
+                "did not acknowledge the request."
+            ),
+        }
+    return {
+        "status": "ok",
+        "safety_status": "clear",
+        "receiver_synced": True,
+        "message": (
+            "Construction safety state cleared by the operator. The dashboard is green unless "
+            "the Safety scanner detects a new hazard."
+        ),
+    }
 
-    with _agentic_lock:
-        already_active = _agentic_state["mode"] == AGENTIC_MODE_EMERGENCY
-        _agentic_state["mode"] = AGENTIC_MODE_EMERGENCY
-        _agentic_state["emergency_intent"] = clean_intent
 
-    camera_results = _set_all_cameras_default()
-    if already_active:
-        emergency_scanner.update_intent(clean_intent)
-        message = f"Emergency intent updated: {clean_intent}"
+def set_operational_mode(mode: str, objective: Optional[str] = None) -> dict:
+    clean_mode = str(mode or "").strip().lower()
+    clean_objective = str(objective or "").strip() or None
+    if clean_mode not in OPERATIONAL_MODES:
+        return {
+            "status": "error",
+            "error": (
+                f"Unknown operational mode '{clean_mode}'. Available modes: "
+                f"{', '.join(sorted(OPERATIONAL_MODES))}."
+            ),
+        }
+    if clean_mode == "search" and not clean_objective:
+        return {
+            "status": "error",
+            "error": "Search Mode requires a visual target or object description.",
+        }
+    if clean_mode in {"free", "safety"}:
+        clean_objective = None
+
+    with _orchestration_lock:
+        return _set_operational_mode_locked(clean_mode, clean_objective)
+
+
+def _set_operational_mode_locked(clean_mode: str, clean_objective: Optional[str]) -> dict:
+    with _operational_lock:
+        previous_mode = _operational_state["mode"]
+        _operational_state["mode"] = clean_mode
+        _operational_state["objective"] = clean_objective
+
+    if clean_mode == "free":
+        search_scanner.stop()
+        safety_scanner.stop()
+        camera_results = _set_all_cameras_default()
+        receiver_synced = _publish_operational_state()
+        failed = [
+            {
+                "camera_id": camera_id,
+                "result": result,
+            }
+            for camera_id, result in zip(sorted(CAMERAS.keys()), camera_results)
+            if result.get("status") != "ok"
+        ]
+
+        if not CAMERAS:
+            message = (
+                "Free Mode activated. Automated scanning is stopped; no cameras are registered."
+            )
+        elif failed:
+            failed_ids = ", ".join(str(item["camera_id"]) for item in failed)
+            message = (
+                "Free Mode is active and automated scanning is stopped, but camera(s) "
+                f"{failed_ids} could not be set to default processing mode."
+            )
+        else:
+            message = (
+                "Free Mode activated. Automated scanning is stopped and all registered cameras "
+                "are in default processing mode for unprocessed live viewing."
+            )
+        if not receiver_synced:
+            message += " The receiver status update is pending."
+
+        _post_system_log(kind="mode", level="info", message=message)
+        if failed:
+            failed_ids = ", ".join(str(item["camera_id"]) for item in failed)
+            _post_system_log(
+                kind="mode",
+                level="warning",
+                message=f"Free Mode could not normalize camera(s): {failed_ids}.",
+            )
+
+        return {
+            "status": "ok" if not failed and receiver_synced else "partial_error",
+            "mode": "free",
+            "objective": None,
+            "scanner_running": False,
+            "placeholder": False,
+            "receiver_synced": receiver_synced,
+            "camera_results": camera_results,
+            "message": message,
+        }
+
+    if clean_mode == "safety":
+        search_scanner.stop()
+        safety_scanner.stop()
+
+        # Publish the selected mode with scanning stopped before normalizing the
+        # fleet. Reconciliation only starts the VLM scanner after the receiver
+        # has acknowledged the state.
+        _publish_operational_state()
+        camera_results = _set_all_cameras_default()
+        receiver_synced = _reconcile_operational_state()
+        scanner_running = safety_scanner.is_running()
+        failed = [
+            {
+                "camera_id": camera_id,
+                "result": result,
+            }
+            for camera_id, result in zip(sorted(CAMERAS.keys()), camera_results)
+            if result.get("status") != "ok"
+        ]
+
+        hours = (
+            f"{SAFETY_ACCESS_START_HOUR:02d}:00-{SAFETY_ACCESS_END_HOUR:02d}:00 "
+            f"{SAFETY_SITE_TIMEZONE}"
+        )
+        message = (
+            f"Safety Mode activated. From {hours}, active camera frames are checked for Fire "
+            "Hazard and Work-Zone Intrusion in one VLM pass. Outside that window, they are "
+            "checked for Fire Hazard and Unauthorized Entry."
+        )
+        if not CAMERAS:
+            message += " No cameras are registered."
+        elif failed:
+            failed_ids = ", ".join(str(item["camera_id"]) for item in failed)
+            message += f" Camera(s) {failed_ids} could not be set to default processing mode."
+        if not receiver_synced:
+            if scanner_running:
+                message += " The Safety scanner is running; its receiver status update is pending."
+            else:
+                message += " The Safety scanner is waiting for the receiver to acknowledge the mode."
+
+        _post_system_log(kind="mode", level="info", message=message)
+        if failed:
+            failed_ids = ", ".join(str(item["camera_id"]) for item in failed)
+            _post_system_log(
+                kind="mode",
+                level="warning",
+                message=f"Safety Mode could not reach camera(s): {failed_ids}.",
+            )
+        if not receiver_synced:
+            _post_system_log(
+                kind="mode",
+                level="warning",
+                message=(
+                    "The Safety scanner is running, but its latest status has not reached the receiver."
+                    if scanner_running
+                    else (
+                        "Safety Mode could not synchronize with the receiver. Scanning will start "
+                        "automatically after synchronization recovers."
+                    )
+                ),
+            )
+
+        return {
+            "status": "ok" if not failed and receiver_synced else "partial_error",
+            "mode": "safety",
+            "objective": None,
+            "scanner_running": scanner_running,
+            "placeholder": False,
+            "receiver_synced": receiver_synced,
+            "camera_results": camera_results,
+            "message": message,
+        }
+
+    if clean_mode in PLACEHOLDER_OPERATIONAL_MODES:
+        search_scanner.stop()
+        safety_scanner.stop()
+        receiver_synced = _publish_operational_state()
+        label = clean_mode.title()
+        message = (
+            f"{label} Mode selected. Its camera-orchestration workflow is a placeholder "
+            "and will be configured when its requirements are finalized."
+        )
+        if not receiver_synced:
+            message += " The receiver status update is pending."
+        _post_system_log(kind="mode", level="info", message=message)
+        return {
+            "status": "ok" if receiver_synced else "partial_error",
+            "mode": clean_mode,
+            "objective": clean_objective,
+            "scanner_running": False,
+            "placeholder": True,
+            "receiver_synced": receiver_synced,
+            "camera_results": [],
+            "message": message,
+        }
+
+    assert clean_mode == "search"
+    assert clean_objective is not None
+    safety_scanner.stop()
+    search_was_running = previous_mode == "search" and search_scanner.is_running()
+    if search_was_running:
+        search_scanner.stop()
+        message = f"Search target updated: {clean_objective}"
     else:
-        emergency_scanner.start(clean_intent)
-        message = f"Emergency mode activated: {clean_intent}"
-    _publish_agentic_state()
-    _post_system_log(kind="mode", level="critical", message=message)
+        message = f"Search Mode activated: {clean_objective}"
+
+    # Announce the new objective while scanning is stopped, then normalize all
+    # cameras again so retargeting also recovers Pis that were offline or reset.
+    _publish_operational_state()
+    camera_results = _set_all_cameras_default()
+    receiver_synced = _reconcile_operational_state()
+    scanner_running = search_scanner.is_running()
+    if not receiver_synced:
+        if scanner_running:
+            message += " The scanner is running; its receiver status update is pending."
+        else:
+            message += " The Search scanner is waiting for the receiver to acknowledge the objective."
+    _post_system_log(kind="mode", level="info", message=message)
 
     failed = [
         {
@@ -218,37 +582,46 @@ def activate_emergency_mode(intent: str) -> dict:
         _post_system_log(
             kind="mode",
             level="warning",
-            message=f"Emergency default-mode command could not reach camera(s): {failed_ids}.",
+            message=f"Search Mode could not reach camera(s): {failed_ids}.",
         )
 
-    return {
-        "status": "ok" if not failed else "partial_error",
-        "mode": AGENTIC_MODE_EMERGENCY,
-        "emergency_intent": clean_intent,
-        "scanner_running": emergency_scanner.is_running(),
-        "camera_results": camera_results,
-    }
-
-
-def deactivate_emergency_mode(reason: Optional[str] = None) -> dict:
-    with _agentic_lock:
-        was_active = _agentic_state["mode"] == AGENTIC_MODE_EMERGENCY
-        _agentic_state["mode"] = AGENTIC_MODE_FREE
-        _agentic_state["emergency_intent"] = None
-    emergency_scanner.stop()
-    _publish_agentic_state()
-    if was_active:
-        suffix = f" Reason: {reason.strip()}" if reason and reason.strip() else ""
+    if not receiver_synced:
+        synchronization_detail = (
+            "The Search scanner is running, but its latest status has not reached the receiver."
+            if scanner_running
+            else (
+                "Search Mode could not synchronize its objective with the receiver. "
+                "Scanning will start automatically after synchronization recovers."
+            )
+        )
         _post_system_log(
             kind="mode",
-            level="info",
-            message=f"Emergency mode cleared. System returned to Free mode.{suffix}",
+            level="warning",
+            message=synchronization_detail,
         )
+
     return {
-        "status": "ok",
-        "mode": AGENTIC_MODE_FREE,
-        "scanner_running": emergency_scanner.is_running(),
+        "status": "ok" if not failed and receiver_synced else "partial_error",
+        "mode": "search",
+        "objective": clean_objective,
+        "scanner_running": scanner_running,
+        "placeholder": False,
+        "receiver_synced": receiver_synced,
+        "camera_results": camera_results,
+        "message": message,
     }
+
+
+def initialize_startup_mode() -> dict:
+    """Normalize the fleet into Free Mode once before the UI accepts commands."""
+    global _startup_mode_initialized
+
+    with _startup_mode_lock:
+        if _startup_mode_initialized:
+            return get_operational_mode_tool()
+        result = set_operational_mode("free")
+        _startup_mode_initialized = True
+        return result
 
 
 def _coerce_camera_ids(args: dict) -> list[int]:
@@ -382,49 +755,112 @@ tools = [
     },
     {
         "type": "function",
-        "name": "activate_emergency_mode",
+        "name": "set_operational_mode",
         "description": (
-            "Switch the whole system into Emergency agentic mode. Use this immediately when "
-            "the operator reports an emergency, a missing person, a person of interest, or asks "
-            "the system to search across cameras for a described intent. This sets every reachable "
-            "camera to default mode and starts laptop-side VLM scanning of active streams."
+            "Select the fleet-wide operational mode. Free Mode stops Search and sets every reachable "
+            "camera to default processing for unprocessed live viewing. Search Mode configures cameras "
+            "for raw streaming and starts laptop-side VLM scanning for any visible target, including "
+            "people, animals, vehicles, equipment, or other objects. Safety Mode configures cameras "
+            "for raw streaming and scans each frame for construction hazards. Investigation Mode is "
+            "currently a selectable placeholder. Daily reporting is a separate background capability, "
+            "not an operational mode."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "intent": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["free", "safety", "search", "investigation"],
+                    "description": "The fleet-wide operational mode to select.",
+                },
+                "objective": {
                     "type": "string",
                     "description": (
-                        "A concise visual-search intent copied from the operator's request, "
-                        "for example 'missing worker wearing a red hard hat and yellow vest'."
+                        "The operator's objective. Required for Search Mode as a concise visual target "
+                        "description, for example 'red fire extinguisher' or 'child in a blue jacket'. "
+                        "Unused for Free and Safety Modes and optional for Investigation Mode."
                     ),
                 },
             },
-            "required": ["intent"],
+            "required": ["mode"],
         },
     },
     {
         "type": "function",
-        "name": "deactivate_emergency_mode",
+        "name": "get_operational_mode",
         "description": (
-            "Return the system to Free agentic mode after the operator says the emergency "
-            "is resolved, cancelled, or should stop."
+            "Report the current fleet-wide operational mode, its objective, whether its workflow is "
+            "a placeholder, and whether that mode's scanner is running."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "type": "function",
+        "name": "get_safety_state",
+        "description": (
+            "Report whether the latched construction safety state is clear or in a stop-work hazard "
+            "state, including the active hazard causes recorded by the receiver."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "type": "function",
+        "name": "clear_safety_hazard",
+        "description": (
+            "Explicitly clear the latched red construction safety hazard state after the operator "
+            "asks to clear, reset, or acknowledge it. This does not change operational mode."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "reason": {
                     "type": "string",
-                    "description": "Optional operator-provided reason for clearing the emergency.",
-                },
+                    "description": "Optional short operator-provided reason for clearing the state.",
+                }
             },
         },
     },
     {
         "type": "function",
-        "name": "get_agentic_mode",
-        "description": "Report whether the system is currently in Free or Emergency agentic mode.",
-        "parameters": {"type": "object", "properties": {}},
+        "name": "get_reporting_status",
+        "description": (
+            "Check hourly construction-report snapshot coverage for a date without changing the "
+            "current operational mode. If date is omitted, use the current site-local date."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "report_date": {
+                    "type": "string",
+                    "description": "Optional date in YYYY-MM-DD format.",
+                }
+            },
+        },
+    },
+    {
+        "type": "function",
+        "name": "generate_daily_report",
+        "description": (
+            "Generate a PDF construction progress report from the requested day's hourly camera "
+            "snapshots. This does not switch operational mode. Include the operator's stated daily "
+            "goal when provided; it improves progress and completion reasoning. If date is omitted, "
+            "use the current site-local date."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "report_date": {
+                    "type": "string",
+                    "description": "Optional report date in YYYY-MM-DD format.",
+                },
+                "goal": {
+                    "type": "string",
+                    "description": (
+                        "Optional construction goal for that day, copied faithfully from the operator."
+                    ),
+                },
+            },
+        },
     },
 ]
 
@@ -440,7 +876,7 @@ def _camera_roster_text() -> str:
 
 
 SYSTEM_PROMPT = f"""
-You are a supervisor assistant for a multi-camera smart construction monitoring system.
+You are a supervisor assistant for a multi-camera operations system.
 Each camera has a unique integer id and is connected to its own Raspberry Pi.
 
 {_camera_roster_text()}
@@ -462,22 +898,69 @@ Behaviour rules:
   above.
 - Use `list_cameras` when the user asks what cameras exist, or when a request
   does not specify which camera_id to act on and you need to list the options.
-- The system also has an agentic mode. It starts in `free`, where cameras may
-  be controlled independently.
-- If the operator reports an emergency, missing person, person of interest, or
-  asks to search all cameras for a visual intent, immediately call
-  `activate_emergency_mode` with a concise visual-search intent copied from the
-  request. Do not ask for confirmation first.
-- In `emergency` mode, all reachable cameras should remain in `default` mode
-  while the laptop-side VLM scanner inspects active streams. If the operator
-  asks to stop or clear the emergency, call `deactivate_emergency_mode`.
-- Use `get_agentic_mode` when the user asks whether the system is in Free or
-  Emergency mode.
+- Separate from per-camera processing modes, the fleet has four operational
+  modes: `free`, `safety`, `search`, and `investigation`. It starts
+  in Free Mode.
+- Use `set_operational_mode` whenever the operator asks to enter or switch an
+  operational mode. Use `get_operational_mode` when asked which operational
+  mode is active or what objective it is pursuing.
+- Search Mode is the implemented fleet-wide visual-search workflow. When the
+  operator explicitly asks for Search Mode, or asks the system to find or
+  locate a described target across cameras, call `set_operational_mode` with
+  mode `search` and a concise objective copied from the request. The target can
+  be any visibly identifiable person, animal, vehicle, equipment, or object.
+  Do not ask for confirmation when a target description is already present; if
+  it is missing, ask what the system should search for.
+- In Search Mode, all reachable cameras remain in `default` processing mode
+  while the laptop-side VLM scanner inspects active streams. Reject requests to
+  move individual cameras to other processing modes until Search Mode is left.
+- Safety Mode is the implemented continuous construction-safety workflow. It
+  keeps every reachable camera in `default` processing mode and evaluates each
+  sampled frame once against exactly two applicable checks. During the configured
+  09:00-17:00 site-local construction window, those checks are `Fire Hazard`
+  and `Work-Zone Intrusion`. Outside that window, machinery is considered off,
+  so the checks are `Fire Hazard` and `Unauthorized Entry`. A frame can
+  trigger more than one hazard. Safety alerts are red, include a visible
+  STOP WORK message and cause, and latch the construction safety state red.
+- A latched hazard survives operational-mode changes.
+  Call `clear_safety_hazard` only when the operator explicitly asks to clear,
+  reset, or acknowledge the safety state. Never clear it merely because the
+  operator selects another mode. Use `get_safety_state` when asked whether the
+  construction site is currently clear or which hazards are active.
+- In Safety Mode, cameras are also locked to `default` processing so the Safety
+  scanner continues receiving unmodified frames. Reject requests to move an
+  individual camera to another processing mode until Safety Mode is left.
+- Free Mode is the neutral live-view baseline. Selecting it stops Search,
+  stops Safety scanning, clears the Search objective, and sets every reachable
+  camera to `default` processing mode so the operator sees unprocessed footage
+  with no automated scanner or operational workflow running. Free Mode does
+  not clear a latched construction safety hazard.
+- Investigation Mode is a placeholder until its workflow is defined. Still
+  call `set_operational_mode` when it is requested, then clearly explain that
+  no automatic camera reconfiguration is configured for it yet.
+- Daily reporting is not an operational mode and never interrupts the active
+  operational mode. A passive recorder saves one fresh frame per registered
+  camera at each hourly slot from {REPORTING_CAPTURE_START_HOUR:02d}:00 through
+  {REPORTING_CAPTURE_END_HOUR:02d}:00 in {REPORTING_SITE_TIMEZONE}. Use
+  `get_reporting_status` when asked what evidence is available for a date.
+- Use `generate_daily_report` when the operator asks for a daily construction
+  report. Pass the requested date in YYYY-MM-DD form; if the operator says
+  "today", omit the date so the site-local current date is used. Pass the
+  operator's goal exactly when one is provided. Do not ask for a goal because
+  it is optional. The tool compares each camera's ordered daily sequence,
+  synthesizes the camera observations, and creates a PDF. In text chat, present
+  the returned `report_url` as a Markdown link. If someone asks to enter
+  Reporting Mode, explain that reporting now runs in the background and ask
+  which day's report they want instead of changing operational mode.
+- If the operator asks to stop or cancel Search Mode without naming a next
+  operational mode, switch to Free Mode.
 - If the user targets a camera that is not registered, politely say so and list
   the available camera ids.
-- After any tool result, explain clearly what happened:
-  - On success, confirm the camera (by id and name) and the mode.
-  - On error, explain the error in simple terms and suggest what to try.
+- After any camera tool result, explain clearly what happened. On success,
+  confirm the camera (by id and name) and processing mode. On error, explain
+  the problem in simple terms and suggest what to try.
+- After an operational-mode result, confirm the selected mode and objective.
+  If the result says it is a placeholder, always say so plainly.
 - For casual chat, respond normally without mentioning cameras.
 """
 
@@ -492,12 +975,14 @@ Voice conversation rules:
 - Do not read raw JSON or internal tool names out loud. Summarize the result in
   plain language after a tool call finishes.
 - When a command changes camera state, briefly confirm the camera id, name, and
-  new mode. When a command is ambiguous, ask a short clarifying question.
+  new processing mode. When it changes the fleet's operational mode, confirm
+  that mode and its objective. When a command is ambiguous, ask a short
+  clarifying question.
 """
 
 
-def execute_camera_tool(tool_name: str, args: Any) -> dict:
-    """Execute one of the camera tools for text and realtime voice sessions."""
+def execute_supervisor_tool(tool_name: str, args: Any) -> dict:
+    """Execute a camera or operational-mode tool for text and realtime voice sessions."""
     if isinstance(args, str):
         try:
             args = json.loads(args) if args else {}
@@ -517,18 +1002,20 @@ def execute_camera_tool(tool_name: str, args: Any) -> dict:
                 "status": "error",
                 "error": f"Missing or invalid argument for set_camera_mode: {str(e)}",
             }
-        with _agentic_lock:
-            current_agentic_mode = _agentic_state["mode"]
-        if current_agentic_mode == AGENTIC_MODE_EMERGENCY and mode != "default":
-            return {
-                "status": "error",
-                "error": (
-                    "Emergency mode is active. Cameras are locked to default mode "
-                    "until the emergency is cleared."
-                ),
-            }
-        results = [call_pi_set_mode(camera_id, mode) for camera_id in camera_ids]
-        return _combine_camera_results("set_camera_mode", camera_ids, results)
+        with _orchestration_lock:
+            with _operational_lock:
+                current_operational_mode = _operational_state["mode"]
+            if current_operational_mode in {"search", "safety"} and mode != "default":
+                label = current_operational_mode.title()
+                return {
+                    "status": "error",
+                    "error": (
+                        f"{label} Mode is active. Cameras are locked to default processing mode "
+                        "until another operational mode is selected."
+                    ),
+                }
+            results = [call_pi_set_mode(camera_id, mode) for camera_id in camera_ids]
+            return _combine_camera_results("set_camera_mode", camera_ids, results)
 
     if tool_name == "get_camera_state":
         try:
@@ -544,14 +1031,35 @@ def execute_camera_tool(tool_name: str, args: Any) -> dict:
     if tool_name == "list_cameras":
         return list_cameras_tool()
 
-    if tool_name == "activate_emergency_mode":
-        return activate_emergency_mode(str(args.get("intent") or ""))
+    if tool_name == "set_operational_mode":
+        return set_operational_mode(
+            str(args.get("mode") or ""),
+            args.get("objective"),
+        )
 
-    if tool_name == "deactivate_emergency_mode":
-        return deactivate_emergency_mode(args.get("reason"))
+    if tool_name == "get_operational_mode":
+        return get_operational_mode_tool()
 
-    if tool_name == "get_agentic_mode":
-        return get_agentic_mode_tool()
+    if tool_name == "get_safety_state":
+        return get_safety_state_tool()
+
+    if tool_name == "clear_safety_hazard":
+        return clear_safety_hazard(args.get("reason"))
+
+    if tool_name == "get_reporting_status":
+        try:
+            return reporting_service.get_status(args.get("report_date"))
+        except ValueError as exc:
+            return {"status": "error", "error": str(exc)}
+
+    if tool_name == "generate_daily_report":
+        try:
+            return reporting_service.generate_daily_report(
+                args.get("report_date"),
+                args.get("goal"),
+            )
+        except ValueError as exc:
+            return {"status": "error", "error": str(exc)}
 
     return {"status": "error", "error": f"Unknown tool call: {tool_name}"}
 
@@ -653,7 +1161,7 @@ def attach_voice_routes(app) -> None:
         if not tool_name:
             return JSONResponse({"error": "Missing tool name."}, status_code=400)
 
-        result = execute_camera_tool(tool_name, tool_args)
+        result = execute_supervisor_tool(tool_name, tool_args)
         return JSONResponse(
             {
                 "call_id": payload.get("call_id"),
@@ -662,9 +1170,28 @@ def attach_voice_routes(app) -> None:
             }
         )
 
-    @app.get("/agentic/state")
-    async def get_agentic_state():
-        return JSONResponse(get_agentic_mode_tool())
+    @app.get("/operational/state")
+    async def get_operational_state():
+        state = get_operational_mode_tool()
+        safety_state = get_safety_state_tool(timeout_sec=0.5)
+        if safety_state.get("status") == "ok":
+            state["safety_status"] = safety_state["safety_status"]
+            state["active_safety_hazards"] = safety_state["active_hazards"]
+        else:
+            state["safety_status"] = "unknown"
+            state["active_safety_hazards"] = []
+        return JSONResponse(state)
+
+    @app.get("/reports/{filename}")
+    async def download_daily_report(filename: str):
+        report_path = reporting_service.resolve_report_path(filename)
+        if report_path is None:
+            return JSONResponse({"error": "Report not found."}, status_code=404)
+        return FileResponse(
+            report_path,
+            media_type="application/pdf",
+            filename=report_path.name,
+        )
 
 
 def supervisor_step(user_msg, chat_history, conversation):
@@ -697,12 +1224,12 @@ def supervisor_step(user_msg, chat_history, conversation):
         for tool_call in tool_calls:
             call_id = getattr(tool_call, "call_id", None)
             if not call_id:
-                assistant_text = "The model requested a camera tool without a call id."
+                assistant_text = "The model requested a supervisor tool without a call id."
                 conversation.append({"role": "assistant", "content": assistant_text})
                 chat_history.append((user_msg, assistant_text))
                 return chat_history, conversation
 
-            tool_result = execute_camera_tool(
+            tool_result = execute_supervisor_tool(
                 getattr(tool_call, "name", None),
                 getattr(tool_call, "arguments", None),
             )
@@ -832,10 +1359,16 @@ SUPERVISOR_CSS = """
   text-transform: uppercase;
   letter-spacing: 0.06em;
 }
-.sup-mode-chip.emergency {
-  border-color: rgba(239, 68, 68, 0.42);
-  background: rgba(239, 68, 68, 0.14);
-  color: #ff8d8d;
+.sup-mode-chip.search {
+  border-color: rgba(56, 189, 248, 0.42);
+  background: rgba(56, 189, 248, 0.14);
+  color: #7dd3fc;
+}
+.sup-mode-chip.hazard {
+  border-color: rgba(248, 113, 113, 0.78);
+  background: rgba(185, 28, 28, 0.3);
+  color: #fecaca;
+  box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.15), 0 8px 24px rgba(127, 29, 29, 0.28);
 }
 .sup-mode-dot {
   width: 8px;
@@ -1402,7 +1935,7 @@ SUPERVISOR_JS = r"""
       if (!state.dc || state.dc.readyState !== "open") return;
 
       state.handledCalls.add(callId);
-      setStatus("Running camera command", "working", name);
+      setStatus("Running supervisor command", "working", name);
 
       let payload;
       try {
@@ -1417,7 +1950,7 @@ SUPERVISOR_JS = r"""
         });
         payload = await res.json().catch(() => ({}));
         if (!res.ok) {
-          throw new Error(payload.error || "Camera tool call failed.");
+          throw new Error(payload.error || "Supervisor tool call failed.");
         }
       } catch (error) {
         payload = { result: { status: "error", error: error.message } };
@@ -1697,20 +2230,26 @@ SUPERVISOR_JS = r"""
     });
   }
 
-  function initAgenticModeChip() {
+  function initOperationalModeChip() {
     const chip = document.getElementById("sup-mode-chip");
     const label = document.getElementById("sup-mode-label");
     if (!chip || !label) {
-      window.setTimeout(initAgenticModeChip, RETRY_MS);
+      window.setTimeout(initOperationalModeChip, RETRY_MS);
       return;
     }
     async function refreshMode() {
       try {
-        const res = await fetch("/agentic/state");
+        const res = await fetch("/operational/state");
         const state = await res.json();
-        const emergency = state.mode === "emergency";
-        chip.classList.toggle("emergency", emergency);
-        label.textContent = emergency ? "Emergency" : "Free";
+        const mode = ["free", "safety", "search", "investigation"].includes(state.mode)
+          ? state.mode
+          : "free";
+        const hazard = state.safety_status === "hazard";
+        chip.classList.remove("free", "safety", "search", "investigation", "hazard");
+        chip.classList.add(mode);
+        if (hazard) chip.classList.add("hazard");
+        const modeLabel = mode.charAt(0).toUpperCase() + mode.slice(1);
+        label.textContent = hazard ? "Stop work · " + modeLabel : modeLabel;
       } catch (error) {
         label.textContent = "Unknown";
       }
@@ -1721,7 +2260,7 @@ SUPERVISOR_JS = r"""
 
   function initSupervisorUi() {
     initVoiceClient();
-    initAgenticModeChip();
+    initOperationalModeChip();
   }
 
   if (document.readyState === "loading") {
@@ -1737,9 +2276,9 @@ def _supervisor_header_html() -> str:
     return """<header class="sup-page-header">
   <div class="sup-title-block">
     <h1>Supervisor</h1>
-    <p class="sup-sub">Natural-language control for your multi-camera fleet — switch modes, read status, or list registered devices.</p>
+    <p class="sup-sub">Natural-language control for your multi-camera fleet — select an operational mode, configure cameras, or read status.</p>
   </div>
-  <div class="sup-mode-chip" id="sup-mode-chip"><span class="sup-mode-dot"></span><span id="sup-mode-label">Free</span></div>
+  <div class="sup-mode-chip free" id="sup-mode-chip"><span class="sup-mode-dot"></span><span id="sup-mode-label">Free</span></div>
 </header>"""
 
 
@@ -1796,6 +2335,9 @@ def _voice_panel_html() -> str:
 
 
 def build_ui():
+    initialize_startup_mode()
+    start_operational_state_publisher()
+    start_reporting_recorder()
     with gr.Blocks(
         title="Supervisor Agent",
         theme=_supervisor_theme(),
