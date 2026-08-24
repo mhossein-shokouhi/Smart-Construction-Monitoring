@@ -1,4 +1,4 @@
-"""Background construction snapshots and on-demand daily PDF reports."""
+"""Minute-by-minute construction snapshots and on-demand interval PDF reports."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Optional
 from zoneinfo import ZoneInfo
@@ -29,6 +29,7 @@ class ReportingSnapshot:
     camera_location: str
     camera_zone: str
     slot_hour: int
+    slot_minute: int
     scheduled_at: str
     captured_at: str
     receiver_frame_time: float
@@ -47,7 +48,7 @@ class ReportingSnapshot:
 
 
 class ConstructionReporting:
-    """Record hourly evidence and turn one day of evidence into a PDF report.
+    """Record one frame per minute and report a requested recent interval.
 
     The recorder is deliberately passive: it reads the receiver's latest frame
     and never changes camera or operational modes. Report generation performs
@@ -65,22 +66,21 @@ class ConstructionReporting:
         image_detail: str = "high",
         reasoning_effort: str = "medium",
         site_timezone: str = "America/Vancouver",
-        capture_start_hour: int = 9,
-        capture_end_hour: int = 17,
-        capture_poll_sec: float = 30.0,
+        capture_poll_sec: float = 10.0,
         max_frame_age_sec: float = 10.0,
         max_analysis_workers: int = 2,
+        max_frames_per_camera: int = 24,
         snapshot_root: str | Path | None = None,
         output_dir: str | Path | None = None,
         now_provider: Callable[[], datetime] | None = None,
         log_callback: Callable[..., None] | None = None,
     ) -> None:
-        if not 0 <= capture_start_hour <= capture_end_hour <= 23:
-            raise ValueError("Reporting capture hours must be ordered integers from 0 through 23.")
         if capture_poll_sec <= 0:
             raise ValueError("Reporting capture poll interval must be positive.")
         if max_frame_age_sec <= 0:
             raise ValueError("Reporting maximum frame age must be positive.")
+        if max_frames_per_camera < 2:
+            raise ValueError("Reporting must allow at least two analysis frames per camera.")
 
         self.client = client
         self.receiver_url = receiver_url.rstrip("/")
@@ -96,11 +96,10 @@ class ConstructionReporting:
         self.reasoning_effort = reasoning_effort
         self.site_timezone_name = site_timezone
         self.site_timezone = ZoneInfo(site_timezone)
-        self.capture_start_hour = capture_start_hour
-        self.capture_end_hour = capture_end_hour
         self.capture_poll_sec = capture_poll_sec
         self.max_frame_age_sec = max_frame_age_sec
         self.max_analysis_workers = max(1, max_analysis_workers)
+        self.max_frames_per_camera = int(max_frames_per_camera)
         self.snapshot_root = Path(
             snapshot_root
             or Path(tempfile.gettempdir()) / "rogers-scp-reporting-snapshots"
@@ -116,11 +115,7 @@ class ConstructionReporting:
         self._report_lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
-        self._logged_capture_failures: set[tuple[str, int, int]] = set()
-
-    @property
-    def scheduled_hours(self) -> tuple[int, ...]:
-        return tuple(range(self.capture_start_hour, self.capture_end_hour + 1))
+        self._logged_capture_failures: set[tuple[str, int, int, int]] = set()
 
     def _site_now(self) -> datetime:
         current = self.now_provider() if self.now_provider is not None else datetime.now(self.site_timezone)
@@ -129,7 +124,7 @@ class ConstructionReporting:
         return current.astimezone(self.site_timezone)
 
     def start(self) -> None:
-        """Start the once-per-hour capture loop if it is not already running."""
+        """Start the once-per-minute capture loop if it is not already running."""
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return
@@ -163,8 +158,7 @@ class ConstructionReporting:
                 kind="reporting",
                 level="info",
                 message=(
-                    "Hourly reporting capture is active from "
-                    f"{self.capture_start_hour:02d}:00 through {self.capture_end_hour:02d}:00 "
+                    "Minute-by-minute reporting capture is active in "
                     f"{self.site_timezone_name}."
                 ),
             )
@@ -175,7 +169,7 @@ class ConstructionReporting:
                     self._log(
                         kind="reporting",
                         level="warning",
-                        message=f"Hourly reporting capture encountered an error: {exc}",
+                        message=f"Minute reporting capture encountered an error: {exc}",
                     )
                 stop_event.wait(self.capture_poll_sec)
         finally:
@@ -189,29 +183,28 @@ class ConstructionReporting:
             return self._capture_due_unlocked(current)
 
     def _capture_due_unlocked(self, current: datetime | None = None) -> dict[str, Any]:
-        """Capture every still-missing camera for the current scheduled hour."""
+        """Capture every still-missing camera for the current clock minute."""
         now = current or self._site_now()
         if now.tzinfo is None:
             now = now.replace(tzinfo=self.site_timezone)
         else:
             now = now.astimezone(self.site_timezone)
 
-        if now.hour not in self.scheduled_hours:
-            return {
-                "status": "not_due",
-                "date": now.date().isoformat(),
-                "message": "The current time is outside the scheduled reporting capture window.",
-                "captured": [],
-                "already_present": [],
-                "failed": [],
-            }
-
         report_date = now.date().isoformat()
+        current_slot = (report_date, now.hour, now.minute)
+        self._logged_capture_failures = {
+            key for key in self._logged_capture_failures if key[:3] == current_slot
+        }
         captured: list[int] = []
         already_present: list[int] = []
         failed: list[dict[str, Any]] = []
         for camera_id, camera in sorted(self.cameras.items()):
-            image_path, metadata_path = self._slot_paths(report_date, camera_id, now.hour)
+            image_path, metadata_path = self._slot_paths(
+                report_date,
+                camera_id,
+                now.hour,
+                now.minute,
+            )
             if image_path.is_file() and metadata_path.is_file():
                 already_present.append(camera_id)
                 continue
@@ -223,6 +216,7 @@ class ConstructionReporting:
                     now.month,
                     now.day,
                     now.hour,
+                    now.minute,
                     tzinfo=self.site_timezone,
                 ).isoformat(timespec="seconds")
                 metadata = {
@@ -232,6 +226,7 @@ class ConstructionReporting:
                     "camera_location": str(camera.get("location") or ""),
                     "camera_zone": str(camera.get("zone") or "Unassigned"),
                     "slot_hour": now.hour,
+                    "slot_minute": now.minute,
                     "scheduled_at": scheduled_at,
                     "captured_at": captured_at,
                     "receiver_frame_time": receiver_frame_time,
@@ -242,7 +237,9 @@ class ConstructionReporting:
                     json.dumps(metadata, indent=2, sort_keys=True).encode("utf-8"),
                 )
                 captured.append(camera_id)
-                self._logged_capture_failures.discard((report_date, now.hour, camera_id))
+                self._logged_capture_failures.discard(
+                    (report_date, now.hour, now.minute, camera_id)
+                )
             except Exception as exc:
                 failed.append({"camera_id": camera_id, "error": str(exc)})
 
@@ -252,11 +249,12 @@ class ConstructionReporting:
                 kind="reporting",
                 level="info",
                 message=(
-                    f"Saved {now.hour:02d}:00 reporting snapshot(s) for camera(s) {camera_text}."
+                    f"Saved {now.hour:02d}:{now.minute:02d} reporting snapshot(s) "
+                    f"for camera(s) {camera_text}."
                 ),
             )
         for item in failed:
-            key = (report_date, now.hour, int(item["camera_id"]))
+            key = (report_date, now.hour, now.minute, int(item["camera_id"]))
             if key in self._logged_capture_failures:
                 continue
             self._logged_capture_failures.add(key)
@@ -264,7 +262,7 @@ class ConstructionReporting:
                 kind="reporting",
                 level="warning",
                 message=(
-                    f"Could not save the {now.hour:02d}:00 reporting snapshot for camera "
+                    f"Could not save the {now.hour:02d}:{now.minute:02d} reporting snapshot for camera "
                     f"{item['camera_id']}: {item['error']}"
                 ),
                 camera_id=int(item["camera_id"]),
@@ -279,7 +277,7 @@ class ConstructionReporting:
         return {
             "status": status,
             "date": report_date,
-            "scheduled_time": f"{now.hour:02d}:00",
+            "scheduled_time": f"{now.hour:02d}:{now.minute:02d}",
             "captured": captured,
             "already_present": already_present,
             "failed": failed,
@@ -303,9 +301,16 @@ class ConstructionReporting:
             raise ValueError(f"latest frame is stale ({frame_age:.1f} seconds old)")
         return frame_bytes, receiver_frame_time
 
-    def _slot_paths(self, report_date: str, camera_id: int, hour: int) -> tuple[Path, Path]:
+    def _slot_paths(
+        self,
+        report_date: str,
+        camera_id: int,
+        hour: int,
+        minute: int,
+    ) -> tuple[Path, Path]:
         camera_dir = self.snapshot_root / report_date / f"camera_{camera_id}"
-        return camera_dir / f"{hour:02d}-00.jpg", camera_dir / f"{hour:02d}-00.json"
+        stem = f"{hour:02d}-{minute:02d}"
+        return camera_dir / f"{stem}.jpg", camera_dir / f"{stem}.json"
 
     @staticmethod
     def _atomic_write(path: Path, content: bytes) -> None:
@@ -356,6 +361,7 @@ class ConstructionReporting:
                         camera_location=str(metadata.get("camera_location") or ""),
                         camera_zone=camera_zone,
                         slot_hour=int(metadata["slot_hour"]),
+                        slot_minute=int(metadata.get("slot_minute", 0)),
                         scheduled_at=str(metadata["scheduled_at"]),
                         captured_at=str(metadata["captured_at"]),
                         receiver_frame_time=float(metadata["receiver_frame_time"]),
@@ -364,82 +370,123 @@ class ConstructionReporting:
                 )
             except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
                 continue
-        return sorted(snapshots, key=lambda item: (item.camera_id, item.slot_hour, item.captured_at))
+        return sorted(snapshots, key=lambda item: (item.camera_id, item.scheduled_at))
+
+    def list_snapshots_between(
+        self,
+        period_start: datetime,
+        period_end: datetime,
+        zone: str | None = None,
+    ) -> list[ReportingSnapshot]:
+        """Return snapshots in the recent interval, using ``start < time <= end``."""
+        start = self._normalize_site_time(period_start)
+        end = self._normalize_site_time(period_end)
+        if end < start:
+            raise ValueError("Report period end must not be before its start.")
+        clean_zone = self._resolve_zone(zone) if zone is not None else None
+        snapshots: list[ReportingSnapshot] = []
+        current_date = start.date()
+        while current_date <= end.date():
+            snapshots.extend(self.list_snapshots(current_date.isoformat(), clean_zone))
+            current_date += timedelta(days=1)
+        return [
+            snapshot
+            for snapshot in snapshots
+            if start < self._snapshot_time(snapshot) <= end
+        ]
 
     def get_status(
         self,
-        report_date: str | None = None,
+        lookback_minutes: int = 60,
         zone: str | None = None,
+        end_time: datetime | None = None,
     ) -> dict[str, Any]:
-        clean_date = self._validate_report_date(report_date or self._site_now().date().isoformat())
+        period_start, period_end, duration = self._interval_bounds(
+            lookback_minutes,
+            end_time,
+        )
         clean_zone = self._resolve_zone(zone) if zone is not None else None
-        snapshots = self.list_snapshots(clean_date, clean_zone)
+        snapshots = self.list_snapshots_between(period_start, period_end, clean_zone)
         grouped = self._group_snapshots(snapshots)
+        expected_times = self._expected_minute_slots(period_start, period_end)
         camera_coverage = []
         for camera_id, camera in sorted(self.cameras.items()):
             if clean_zone is not None and camera.get("zone") != clean_zone:
                 continue
             records = grouped.get(camera_id, [])
+            captured_times = [self._display_snapshot_time(record) for record in records]
             camera_coverage.append(
                 {
                     "camera_id": camera_id,
                     "camera_name": camera.get("name") or f"Camera {camera_id}",
-                    "captured_times": [f"{record.slot_hour:02d}:00" for record in records],
+                    "captured_times": self._summarize_times(captured_times),
                     "captured_count": len(records),
-                    "expected_count": len(self.scheduled_hours),
+                    "expected_count": len(expected_times),
                 }
             )
         return {
             "status": "ok",
-            "date": clean_date,
+            "lookback_minutes": duration,
+            "period_start": period_start.isoformat(timespec="seconds"),
+            "period_end": period_end.isoformat(timespec="seconds"),
             "zone": clean_zone,
             "recorder_running": self.is_running(),
             "site_timezone": self.site_timezone_name,
-            "scheduled_times": [f"{hour:02d}:00" for hour in self.scheduled_hours],
+            "expected_minute_count": len(expected_times),
             "snapshot_count": len(snapshots),
             "camera_coverage": camera_coverage,
             "message": (
-                f"{len(snapshots)} reporting snapshot(s) are available for {clean_date}"
+                f"{len(snapshots)} reporting snapshot(s) are available from the past "
+                f"{duration} minute(s)"
                 + (f" in {clean_zone}." if clean_zone else " across all zones.")
             ),
         }
 
-    def generate_daily_report(
+    def generate_interval_report(
         self,
-        report_date: str | None = None,
+        lookback_minutes: int,
         zone: str | None = None,
         goal: str | None = None,
+        end_time: datetime | None = None,
     ) -> dict[str, Any]:
-        """Analyze one zone's ordered daily frames and write a zone-specific PDF."""
-        clean_date = self._validate_report_date(report_date or self._site_now().date().isoformat())
+        """Analyze one zone's recent frames and write a zone-specific interval PDF."""
+        period_start, period_end, duration = self._interval_bounds(
+            lookback_minutes,
+            end_time,
+        )
         clean_zone = self._resolve_zone(zone)
         clean_goal = str(goal or "").strip() or None
-        if clean_date > self._site_now().date().isoformat():
-            return {"status": "error", "error": "A report cannot be generated for a future date."}
 
         with self._report_lock:
-            if clean_date == self._site_now().date().isoformat():
-                self.capture_due()
-            snapshots = self.list_snapshots(clean_date, clean_zone)
+            site_now = self._site_now()
+            if abs((site_now - period_end).total_seconds()) < 60:
+                self.capture_due(site_now)
+            snapshots = self.list_snapshots_between(period_start, period_end, clean_zone)
             if not snapshots:
                 return {
                     "status": "error",
-                    "date": clean_date,
                     "zone": clean_zone,
+                    "lookback_minutes": duration,
+                    "period_start": period_start.isoformat(timespec="seconds"),
+                    "period_end": period_end.isoformat(timespec="seconds"),
                     "error": (
-                        f"No scheduled camera snapshots are available for {clean_zone} on {clean_date}. "
-                        "The hourly recorder only captures fresh frames from 09:00 through 17:00."
+                        f"No minute snapshots are available for {clean_zone} during the requested "
+                        f"past {duration} minute(s)."
                     ),
                 }
 
             grouped = self._group_snapshots(snapshots)
+            analysis_sequences = {
+                camera_id: self._select_analysis_snapshots(records)
+                for camera_id, records in grouped.items()
+            }
             analyses: list[dict[str, Any]] = []
             analysis_errors: list[dict[str, Any]] = []
             worker_count = min(self.max_analysis_workers, len(grouped))
             with ThreadPoolExecutor(max_workers=max(1, worker_count)) as executor:
                 futures = {
                     executor.submit(self._analyze_camera_sequence, records, clean_goal): camera_id
-                    for camera_id, records in grouped.items()
+                    for camera_id, records in analysis_sequences.items()
                 }
                 for future in as_completed(futures):
                     camera_id = futures[future]
@@ -451,19 +498,29 @@ class ConstructionReporting:
             if not analyses:
                 return {
                     "status": "error",
-                    "date": clean_date,
                     "zone": clean_zone,
+                    "lookback_minutes": duration,
+                    "period_start": period_start.isoformat(timespec="seconds"),
+                    "period_end": period_end.isoformat(timespec="seconds"),
                     "snapshot_count": len(snapshots),
                     "errors": analysis_errors,
                     "error": "The VLM could not analyze any camera sequence for this report.",
                 }
 
             analyses.sort(key=lambda item: int(item.get("camera_id", 0)))
-            coverage = self._coverage_summary(clean_date, clean_zone, grouped, analysis_errors)
+            coverage = self._coverage_summary(
+                period_start,
+                period_end,
+                clean_zone,
+                grouped,
+                analysis_sequences,
+                analysis_errors,
+            )
             synthesis_error: str | None = None
             try:
                 report = self._synthesize_report(
-                    clean_date,
+                    period_start,
+                    period_end,
                     clean_zone,
                     clean_goal,
                     analyses,
@@ -471,11 +528,12 @@ class ConstructionReporting:
                 )
             except Exception as exc:
                 synthesis_error = str(exc)
-                report = self._fallback_report(clean_date, clean_goal, analyses, coverage)
+                report = self._fallback_report(period_start, period_end, clean_goal, analyses, coverage)
 
             try:
                 pdf_path = self._write_pdf(
-                    report_date=clean_date,
+                    period_start=period_start,
+                    period_end=period_end,
                     zone=clean_zone,
                     goal=clean_goal,
                     report=report,
@@ -486,14 +544,19 @@ class ConstructionReporting:
             except Exception as exc:
                 return {
                     "status": "error",
-                    "date": clean_date,
                     "zone": clean_zone,
+                    "lookback_minutes": duration,
+                    "period_start": period_start.isoformat(timespec="seconds"),
+                    "period_end": period_end.isoformat(timespec="seconds"),
                     "snapshot_count": len(snapshots),
                     "error": f"The report was analyzed but its PDF could not be created: {exc}",
                 }
 
             partial = bool(analysis_errors or synthesis_error)
-            message = f"Daily construction progress report created for {clean_zone} on {clean_date}."
+            message = (
+                f"Construction progress report created for {clean_zone} covering the past "
+                f"{duration} minute(s)."
+            )
             if analysis_errors:
                 missing_ids = ", ".join(str(item["camera_id"]) for item in analysis_errors)
                 message += f" Camera analysis was unavailable for: {missing_ids}."
@@ -502,8 +565,10 @@ class ConstructionReporting:
             self._log(kind="reporting", level="info", message=message)
             return {
                 "status": "partial_error" if partial else "ok",
-                "date": clean_date,
                 "zone": clean_zone,
+                "lookback_minutes": duration,
+                "period_start": period_start.isoformat(timespec="seconds"),
+                "period_end": period_end.isoformat(timespec="seconds"),
                 "goal": clean_goal,
                 "snapshot_count": len(snapshots),
                 "camera_count": len(grouped),
@@ -525,7 +590,7 @@ class ConstructionReporting:
             f"The operator's stated goal is: {goal}"
             if goal
             else (
-                "The operator did not provide a daily goal. Describe observed work and change, "
+                "The operator did not provide a goal for this reporting interval. Describe observed work and change, "
                 "but use -1 for completion estimates instead of inventing a target."
             )
         )
@@ -536,7 +601,7 @@ class ConstructionReporting:
             "work, stalled periods, visible issues, and remaining work. Do not claim changes that "
             "are not visually supported. Account for lighting, viewpoint, and occlusion. "
             f"{goal_instruction}\n\n"
-            f"Report date: {first.report_date}\n"
+            f"Reporting interval: {snapshots[0].scheduled_at} through {snapshots[-1].scheduled_at}\n"
             f"Zone: {first.camera_zone}\n"
             f"Camera: {first.camera_name} (id {first.camera_id})\n"
             f"Location: {first.camera_location or 'Not specified'}"
@@ -548,7 +613,8 @@ class ConstructionReporting:
                     "type": "input_text",
                     "text": (
                         f"Snapshot {index} of {len(snapshots)}. Scheduled time "
-                        f"{snapshot.slot_hour:02d}:00; captured at {snapshot.captured_at}."
+                        f"{snapshot.slot_hour:02d}:{snapshot.slot_minute:02d}; "
+                        f"captured at {snapshot.captured_at}."
                     ),
                 }
             )
@@ -584,14 +650,16 @@ class ConstructionReporting:
 
     def _synthesize_report(
         self,
-        report_date: str,
+        period_start: datetime,
+        period_end: datetime,
         zone: str,
         goal: str | None,
         analyses: list[dict[str, Any]],
         coverage: dict[str, Any],
     ) -> dict[str, Any]:
         prompt = (
-            "You are the progress agent for a daily construction report. Synthesize the structured "
+            "You are the progress agent for a construction report covering a specific time interval. "
+            "Synthesize the structured "
             "observations from multiple cameras into one concise, evidence-grounded report. Merge "
             "duplicate observations of the same work, preserve uncertainty, and never treat camera "
             "silence as proof that work stopped. If no operator goal was supplied, set overall "
@@ -599,10 +667,11 @@ class ConstructionReporting:
             "Use plain professional language suitable for a site operator.\n\n"
             + json.dumps(
                 {
-                    "report_date": report_date,
+                    "period_start": period_start.isoformat(timespec="seconds"),
+                    "period_end": period_end.isoformat(timespec="seconds"),
                     "zone": zone,
                     "operator_goal": goal,
-                    "coverage": coverage,
+                    "coverage": self._coverage_for_model(coverage),
                     "camera_observations": analyses,
                 },
                 ensure_ascii=True,
@@ -614,7 +683,7 @@ class ConstructionReporting:
             text={
                 "format": {
                     "type": "json_schema",
-                    "name": "daily_construction_progress_report",
+                    "name": "construction_progress_interval_report",
                     "strict": True,
                     "schema": self._report_schema(),
                 }
@@ -765,11 +834,14 @@ class ConstructionReporting:
 
     def _coverage_summary(
         self,
-        report_date: str,
+        period_start: datetime,
+        period_end: datetime,
         zone: str,
         grouped: dict[int, list[ReportingSnapshot]],
+        analysis_sequences: dict[int, list[ReportingSnapshot]],
         analysis_errors: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        expected_times = self._expected_minute_slots(period_start, period_end)
         cameras = []
         for camera_id, camera in sorted(self.cameras.items()):
             if camera.get("zone") != zone:
@@ -779,19 +851,62 @@ class ConstructionReporting:
                 {
                     "camera_id": camera_id,
                     "camera_name": camera.get("name") or f"Camera {camera_id}",
-                    "captured_times": [f"{record.slot_hour:02d}:00" for record in records],
+                    "captured_times": [self._display_snapshot_time(record) for record in records],
                     "captured_count": len(records),
-                    "expected_count": len(self.scheduled_hours),
+                    "expected_count": len(expected_times),
+                    "analyzed_count": len(analysis_sequences.get(camera_id, [])),
                 }
             )
         return {
-            "date": report_date,
+            "period_start": period_start.isoformat(timespec="seconds"),
+            "period_end": period_end.isoformat(timespec="seconds"),
             "zone": zone,
             "site_timezone": self.site_timezone_name,
-            "scheduled_times": [f"{hour:02d}:00" for hour in self.scheduled_hours],
+            "expected_minute_count": len(expected_times),
             "cameras": cameras,
             "analysis_errors": analysis_errors,
         }
+
+    @staticmethod
+    def _coverage_for_model(coverage: dict[str, Any]) -> dict[str, Any]:
+        """Keep report synthesis context useful without repeating every minute timestamp."""
+        compact_cameras = []
+        for camera in coverage.get("cameras") or []:
+            captured_times = camera.get("captured_times") or []
+            compact_cameras.append(
+                {
+                    "camera_id": camera.get("camera_id"),
+                    "camera_name": camera.get("camera_name"),
+                    "captured_count": camera.get("captured_count", 0),
+                    "expected_count": camera.get("expected_count", 0),
+                    "analyzed_count": camera.get("analyzed_count", 0),
+                    "first_captured_time": captured_times[0] if captured_times else None,
+                    "last_captured_time": captured_times[-1] if captured_times else None,
+                }
+            )
+        return {
+            "period_start": coverage.get("period_start"),
+            "period_end": coverage.get("period_end"),
+            "zone": coverage.get("zone"),
+            "site_timezone": coverage.get("site_timezone"),
+            "expected_minute_count": coverage.get("expected_minute_count", 0),
+            "cameras": compact_cameras,
+            "analysis_errors": coverage.get("analysis_errors") or [],
+        }
+
+    def _select_analysis_snapshots(
+        self,
+        records: list[ReportingSnapshot],
+    ) -> list[ReportingSnapshot]:
+        """Keep short intervals intact and evenly sample long ones for efficient VLM use."""
+        if len(records) <= self.max_frames_per_camera:
+            return list(records)
+        last_index = len(records) - 1
+        indexes = {
+            round(position * last_index / (self.max_frames_per_camera - 1))
+            for position in range(self.max_frames_per_camera)
+        }
+        return [records[index] for index in sorted(indexes)]
 
     @staticmethod
     def _group_snapshots(
@@ -801,12 +916,13 @@ class ConstructionReporting:
         for snapshot in snapshots:
             grouped.setdefault(snapshot.camera_id, []).append(snapshot)
         for records in grouped.values():
-            records.sort(key=lambda item: (item.slot_hour, item.captured_at))
+            records.sort(key=lambda item: item.scheduled_at)
         return grouped
 
     @staticmethod
     def _fallback_report(
-        report_date: str,
+        period_start: datetime,
+        period_end: datetime,
         goal: str | None,
         analyses: list[dict[str, Any]],
         coverage: dict[str, Any],
@@ -846,8 +962,12 @@ class ConstructionReporting:
             )
         summary = " ".join(str(item.get("summary") or "") for item in analyses).strip()
         return {
-            "title": "Daily Construction Progress",
-            "executive_summary": summary or f"Visible construction activity was reviewed for {report_date}.",
+            "title": "Construction Progress Report",
+            "executive_summary": summary or (
+                "Visible construction activity was reviewed from "
+                f"{period_start.strftime('%Y-%m-%d %H:%M')} through "
+                f"{period_end.strftime('%Y-%m-%d %H:%M')}."
+            ),
             "overall_completion_percent": -1,
             "overall_confidence": 0.0,
             "completed_work": list(dict.fromkeys(completed)),
@@ -864,7 +984,8 @@ class ConstructionReporting:
     def _write_pdf(
         self,
         *,
-        report_date: str,
+        period_start: datetime,
+        period_end: datetime,
         zone: str,
         goal: str | None,
         report: dict[str, Any],
@@ -895,13 +1016,16 @@ class ConstructionReporting:
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         generated_at = self._site_now()
-        timestamp = generated_at.strftime("%Y%m%d-%H%M%S")
         zone_slug = self._slugify(zone)
-        pdf_path = self.output_dir / f"construction-progress-{zone_slug}-{report_date}-{timestamp}.pdf"
+        interval_slug = (
+            f"{period_start.strftime('%Y%m%d-%H%M')}-to-"
+            f"{period_end.strftime('%Y%m%d-%H%M')}"
+        )
+        pdf_path = self.output_dir / f"construction-progress-{zone_slug}-{interval_slug}.pdf"
         counter = 2
         while pdf_path.exists():
             pdf_path = self.output_dir / (
-                f"construction-progress-{zone_slug}-{report_date}-{timestamp}-{counter}.pdf"
+                f"construction-progress-{zone_slug}-{interval_slug}-{counter}.pdf"
             )
             counter += 1
 
@@ -1003,7 +1127,7 @@ class ConstructionReporting:
             canvas.drawRightString(
                 width - document.rightMargin,
                 28,
-                f"Daily progress report  |  Page {document.page}",
+                f"Progress report  |  Page {document.page}",
             )
             canvas.restoreState()
 
@@ -1014,21 +1138,26 @@ class ConstructionReporting:
             leftMargin=0.62 * inch,
             topMargin=0.72 * inch,
             bottomMargin=0.58 * inch,
-            title=f"Construction Progress Report - {zone} - {report_date}",
+            title=(
+                f"Construction Progress Report - {zone} - "
+                f"{period_start.isoformat(timespec='minutes')} to "
+                f"{period_end.isoformat(timespec='minutes')}"
+            ),
             author="Agentic Multi-Camera Operations",
         )
         story: list[Any] = []
-        story.append(paragraph(report.get("title") or "Daily Construction Progress", title_style))
+        story.append(paragraph(report.get("title") or "Construction Progress Report", title_style))
         story.append(
             Paragraph(
-                f"REPORT DATE&nbsp;&nbsp; <b>{clean(report_date)}</b>&nbsp;&nbsp;&nbsp;&nbsp; "
                 f"ZONE&nbsp;&nbsp; <b>{clean(zone)}</b>&nbsp;&nbsp;&nbsp;&nbsp; "
+                f"PERIOD&nbsp;&nbsp; <b>{clean(period_start.strftime('%Y-%m-%d %H:%M %Z'))}</b> "
+                f"to <b>{clean(period_end.strftime('%Y-%m-%d %H:%M %Z'))}</b><br/>"
                 f"GENERATED&nbsp;&nbsp; <b>{clean(generated_at.strftime('%Y-%m-%d %H:%M %Z'))}</b>",
                 subtitle_style,
             )
         )
 
-        goal_text = goal or "No explicit daily goal was provided. Progress is described from visible change only."
+        goal_text = goal or "No explicit interval goal was provided. Progress is described from visible change only."
         story.append(
             Table(
                 [[paragraph("OPERATOR GOAL", table_header_style)], [paragraph(goal_text)]],
@@ -1183,7 +1312,9 @@ class ConstructionReporting:
                 image = Image(str(snapshot.image_path))
                 image._restrictSize(3.1 * inch, 2.15 * inch)
                 caption = Paragraph(
-                    f"<b>{clean(snapshot.camera_name)}</b><br/>{snapshot.slot_hour:02d}:00 scheduled | {clean(snapshot.captured_at)}",
+                    f"<b>{clean(snapshot.camera_name)}</b><br/>"
+                    f"{snapshot.slot_hour:02d}:{snapshot.slot_minute:02d} scheduled | "
+                    f"{clean(snapshot.captured_at)}",
                     small_style,
                 )
                 cells.append([image, caption])
@@ -1213,19 +1344,34 @@ class ConstructionReporting:
             )
 
         story.append(paragraph("Evidence coverage and limitations", heading_style))
-        coverage_rows = [[paragraph("Camera", table_header_style), paragraph("Captured", table_header_style), paragraph("Scheduled slots", table_header_style)]]
+        coverage_rows = [[
+            paragraph("Camera", table_header_style),
+            paragraph("Captured", table_header_style),
+            paragraph("VLM frames", table_header_style),
+            paragraph("Available minutes", table_header_style),
+        ]]
         for camera in coverage["cameras"]:
+            captured_times = camera["captured_times"]
+            if len(captured_times) > 12:
+                displayed_times = (
+                    captured_times[:5]
+                    + [f"... {len(captured_times) - 10} more ..."]
+                    + captured_times[-5:]
+                )
+            else:
+                displayed_times = captured_times
             coverage_rows.append(
                 [
                     paragraph(camera["camera_name"], small_style),
                     paragraph(f"{camera['captured_count']} of {camera['expected_count']}", small_style),
-                    paragraph(", ".join(camera["captured_times"]) or "None", small_style),
+                    paragraph(str(camera.get("analyzed_count", camera["captured_count"])), small_style),
+                    paragraph(", ".join(displayed_times) or "None", small_style),
                 ]
             )
         story.append(
             Table(
                 coverage_rows,
-                colWidths=[2.0 * inch, 0.9 * inch, doc.width - 2.9 * inch],
+                colWidths=[1.55 * inch, 0.75 * inch, 0.75 * inch, doc.width - 3.05 * inch],
                 repeatRows=1,
                 style=TableStyle(
                     [
@@ -1253,6 +1399,62 @@ class ConstructionReporting:
 
         doc.build(story, onFirstPage=on_page, onLaterPages=on_page)
         return pdf_path.resolve()
+
+    def _normalize_site_time(self, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=self.site_timezone)
+        return value.astimezone(self.site_timezone)
+
+    def _interval_bounds(
+        self,
+        lookback_minutes: int,
+        end_time: datetime | None,
+    ) -> tuple[datetime, datetime, int]:
+        if isinstance(lookback_minutes, bool):
+            raise ValueError("Report duration must be a whole number of minutes.")
+        try:
+            duration = int(lookback_minutes)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Report duration must be a whole number of minutes.") from exc
+        if str(lookback_minutes).strip() != str(duration) and not (
+            isinstance(lookback_minutes, float) and lookback_minutes.is_integer()
+        ):
+            raise ValueError("Report duration must be a whole number of minutes.")
+        if duration < 1:
+            raise ValueError("Report duration must be at least 1 minute.")
+        if duration > 10080:
+            raise ValueError("Report duration cannot exceed 10,080 minutes (7 days).")
+        period_end = self._normalize_site_time(end_time or self._site_now())
+        return period_end - timedelta(minutes=duration), period_end, duration
+
+    @staticmethod
+    def _expected_minute_slots(
+        period_start: datetime,
+        period_end: datetime,
+    ) -> list[datetime]:
+        cursor = period_start.replace(second=0, microsecond=0)
+        if cursor <= period_start:
+            cursor += timedelta(minutes=1)
+        last_slot = period_end.replace(second=0, microsecond=0)
+        slots = []
+        while cursor <= last_slot:
+            slots.append(cursor)
+            cursor += timedelta(minutes=1)
+        return slots
+
+    def _snapshot_time(self, snapshot: ReportingSnapshot) -> datetime:
+        parsed = datetime.fromisoformat(snapshot.scheduled_at)
+        return self._normalize_site_time(parsed)
+
+    def _display_snapshot_time(self, snapshot: ReportingSnapshot) -> str:
+        return self._snapshot_time(snapshot).strftime("%m-%d %H:%M")
+
+    @staticmethod
+    def _summarize_times(times: list[str], limit: int = 12) -> list[str]:
+        if len(times) <= limit:
+            return times
+        edge_count = max(1, (limit - 1) // 2)
+        return times[:edge_count] + [f"... {len(times) - (2 * edge_count)} more ..."] + times[-edge_count:]
 
     def resolve_report_path(self, filename: str) -> Path | None:
         clean_name = Path(str(filename or "")).name

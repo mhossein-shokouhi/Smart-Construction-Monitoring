@@ -50,7 +50,7 @@ case, Rogers 5G).
 | `supervisor.py` | LLM supervisor agent + Gradio UI (runs on the laptop) |
 | `search_vlm.py` | Laptop-side Search Mode scanner that samples active streams and queries the VLM |
 | `safety_vlm.py` | Laptop-side Safety Mode scanner that evaluates each sampled frame against all applicable construction hazards in one VLM request |
-| `reporting.py` | Passive hourly snapshot recorder plus on-demand temporal VLM analysis and PDF report generation |
+| `reporting.py` | Passive minute-by-minute snapshot recorder plus on-demand temporal VLM analysis and PDF report generation |
 | `stream_receiver_server.py` | Receives streams from all Pis and serves the dashboard (runs on the laptop) |
 | `agent_actuator.py` | FastAPI service that runs on each Raspberry Pi |
 | `raw_stream_demo.py` | Default-mode pipeline (raw Picamera2 stream, no inference overlays) |
@@ -192,9 +192,9 @@ the supervisor in plain English:
 - *"Put the Excavation and Entrance zones in Safety Mode."*
 - *"Is the construction site currently clear?"*
 - *"Clear the safety hazard; the area has been inspected."*
-- *"Generate today's report for the Excavation zone. Our goal was to excavate and level Area B."*
-- *"Generate separate reports for the Excavation and Entrance zones for August 18."*
-- *"How many reporting snapshots were captured for the Excavation zone on August 18?"*
+- *"Generate a report for the Excavation zone covering the past 5 minutes."*
+- *"Generate separate reports for the Excavation and Entrance zones for the past 2 hours. Our goal was to excavate and level Area B."*
+- *"How many reporting snapshots are available for the Excavation zone from the past hour?"*
 
 The supervisor translates each request into the right HTTP call to the
 corresponding Pi, reports back in natural language, and the dashboard updates
@@ -210,7 +210,7 @@ microphone access, and speak commands such as:
 - *"What cameras are available?"*
 - *"Set the front gate camera back to idle."*
 - *"Put the Excavation zone in Search Mode and find the red fire extinguisher."*
-- *"Generate today's construction progress report for the Excavation zone."*
+- *"Generate a construction progress report for the Excavation zone covering the past 10 minutes."*
 - *"Switch the Entrance zone to Investigation Mode."*
 
 Voice chat uses OpenAI's Realtime API over WebRTC. The browser sends microphone
@@ -235,16 +235,15 @@ Optional voice settings:
 | `SAFETY_ACCESS_START_HOUR` | `9` | First permitted construction-hour clock hour, inclusive |
 | `SAFETY_ACCESS_END_HOUR` | `17` | End of permitted construction hours; this hour is after-hours |
 | `OPENAI_REPORTING_VLM_MODEL` | `gpt-5.6` | Vision-capable model used for per-camera timeline analysis and final report synthesis |
-| `OPENAI_REPORTING_VLM_DETAIL` | `high` | Image detail sent for daily report analysis |
+| `OPENAI_REPORTING_VLM_DETAIL` | `high` | Image detail sent for progress-report analysis |
 | `OPENAI_REPORTING_REASONING_EFFORT` | `medium` | Reasoning effort used by both reporting model stages |
-| `REPORTING_SITE_TIMEZONE` | Safety timezone value | IANA timezone used to assign hourly snapshots to a site-local day |
-| `REPORTING_CAPTURE_START_HOUR` | `9` | First hourly report snapshot, inclusive |
-| `REPORTING_CAPTURE_END_HOUR` | `17` | Last hourly report snapshot, inclusive |
-| `REPORTING_CAPTURE_POLL_SEC` | `30` | How often the recorder retries a missing camera within the current hourly slot |
-| `REPORTING_MAX_FRAME_AGE_SEC` | `10` | Maximum age of a receiver frame accepted as hourly evidence |
+| `REPORTING_SITE_TIMEZONE` | Safety timezone value | IANA timezone used for snapshot timestamps and report intervals |
+| `REPORTING_CAPTURE_POLL_SEC` | `10` | How often the recorder checks for a missing snapshot in the current minute |
+| `REPORTING_MAX_FRAME_AGE_SEC` | `10` | Maximum age of a receiver frame accepted as evidence for the current minute |
 | `REPORTING_MAX_ANALYSIS_WORKERS` | `2` | Maximum camera timelines analyzed concurrently |
-| `REPORTING_SNAPSHOT_DIR` | OS temporary directory | Optional directory for timestamped hourly JPEG evidence and metadata |
-| `REPORTING_OUTPUT_DIR` | `output/pdf` | Directory for generated daily PDF reports |
+| `REPORTING_MAX_FRAMES_PER_CAMERA` | `24` | Maximum uniformly sampled frames from each camera sent to the VLM for one report; all saved frames still count toward coverage |
+| `REPORTING_SNAPSHOT_DIR` | OS temporary directory | Optional directory for timestamped minute-by-minute JPEG evidence and metadata |
+| `REPORTING_OUTPUT_DIR` | `output/pdf` | Directory for generated interval PDF reports |
 | `STREAM_RECEIVER_URL` | `http://127.0.0.1:9000` | Receiver URL used by the supervisor to read active streams and publish system logs |
 | `OPERATIONAL_STATE_PUBLISH_INTERVAL_SEC` | `2.0` | How often the supervisor republishes operational state so the receiver can recover after a restart |
 
@@ -328,25 +327,30 @@ or apply camera configuration until that mode's detailed requirements are
 defined. A per-camera processing mode remains available whenever that camera's
 own zone is not in Search or Safety Mode.
 
-## Daily construction reporting
+## Recent construction progress reporting
 
 Reporting is a background capability, not an operational mode. It does not stop
 Search or Safety, change the current operational state, or reconfigure a Pi. While
 the supervisor is running, it reads the receiver's latest fresh frame and saves
-one timestamped JPEG per registered camera for every hourly slot from 09:00
-through 17:00 in the configured site timezone. If a camera is unavailable or its
-frame is stale, the recorder retries during that same hour. Each camera and hour
-is stored only once. The evidence is placed under the operating system's temporary
+one timestamped JPEG per registered camera during every clock minute, all day,
+in the configured site timezone. If a camera is unavailable or its frame is
+stale, the recorder retries during that same minute. Each camera and minute is
+stored only once. The evidence is placed under the operating system's temporary
 directory by default; use `REPORTING_SNAPSHOT_DIR` to choose another location.
 
-When the operator asks for a report, at least one zone must be named. The system
-generates a separate PDF for every requested zone and never mixes another zone's
-frames into it. It uses a compact two-stage analysis for each zone:
+When the operator asks for a report, a recent duration and at least one zone must
+be named. Natural durations are converted to minutes—for example, "past 5
+minutes" uses 5 minutes and "past 2 hours" uses 120 minutes. The system generates
+a separate PDF for every requested zone and never mixes another zone's frames
+into it. It uses a compact two-stage analysis for each zone:
 
-1. Each camera's ordered snapshots are sent together in one multimodal VLM request,
-   with the camera name and capture time immediately before each image. The model
-   returns structured activities, visible changes, progress estimates, issues, and
-   confidence for that camera.
+1. Each camera's ordered snapshots are analyzed in one multimodal VLM request,
+   with the camera name and exact capture time immediately before each image. A
+   short interval uses every available frame. For a long interval, the system
+   uniformly samples up to `REPORTING_MAX_FRAMES_PER_CAMERA` frames—including
+   the first and last—so the model sees the whole period without an oversized
+   request. The model returns structured activities, visible changes, progress
+   estimates, issues, and confidence for that camera.
 2. One text-only synthesis request combines that zone's camera observations, removes
    duplicate views of the same work, and creates the zone narrative. The
    laptop then lays out a downloadable PDF with the summary, timeline, issues,
@@ -355,15 +359,16 @@ frames into it. It uses a compact two-stage analysis for each zone:
 This gives the VLM temporal context without one enormous all-camera image request
 and avoids maintaining a separate always-running progress database. The structured
 observations are working context for the requested report rather than long-term
-agent memory. If the operator includes the day's goal, the report can estimate
+agent memory. If the operator includes the period's goal, the report can estimate
 progress toward it. Without a goal, the prompt explicitly prevents an invented
 completion percentage and reports only visible activity and change.
 
-Generated PDFs use zone-specific filenames, are saved under `output/pdf`, and
-are served from the supervisor at `/reports/<filename>`. Missing cameras or
-timestamps reduce evidence coverage but do not stop a report as long as at least
-one valid snapshot in the requested zone can be analyzed. A report can be
-requested while any operational mode is active.
+Generated PDFs use zone- and time-specific filenames, are saved under
+`output/pdf`, and are served from the supervisor at `/reports/<filename>`.
+Missing cameras or minute timestamps are recorded as reduced evidence coverage
+but do not stop a report as long as at least one valid snapshot in the requested
+zone can be analyzed. A report can be requested while any operational mode is
+active.
 
 ---
 

@@ -3,7 +3,7 @@ import os
 import tempfile
 import threading
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -51,7 +51,7 @@ CAMERA_ANALYSIS = {
 }
 
 FINAL_REPORT = {
-    "title": "Daily Construction Progress",
+    "title": "Construction Progress Report",
     "executive_summary": "Excavation progressed and grading began.",
     "overall_completion_percent": 72,
     "overall_confidence": 0.83,
@@ -80,7 +80,7 @@ FINAL_REPORT = {
             "confidence": 0.84,
         }
     ],
-    "data_notes": ["Two hourly slots were available per camera."],
+    "data_notes": ["Minute snapshots were available for each camera."],
 }
 
 
@@ -117,7 +117,7 @@ class FakeFrameResponse:
 
 
 class ReportingTests(unittest.TestCase):
-    def _service(self, root, *, cameras=None, client=None):
+    def _service(self, root, *, cameras=None, client=None, max_frames_per_camera=24):
         return ConstructionReporting(
             client=client or FakeClient(),
             receiver_url="http://receiver",
@@ -130,27 +130,32 @@ class ReportingTests(unittest.TestCase):
             snapshot_root=Path(root) / "snapshots",
             output_dir=Path(root) / "output" / "pdf",
             max_frame_age_sec=10,
+            max_frames_per_camera=max_frames_per_camera,
         )
 
-    def test_hourly_capture_saves_one_fresh_frame_per_camera_and_deduplicates(self):
-        current = datetime(2026, 8, 18, 9, 0, 3, tzinfo=ZoneInfo("America/Vancouver"))
+    def test_minute_capture_saves_once_per_camera_then_advances_next_minute(self):
+        current = datetime(2026, 8, 18, 9, 12, 3, tzinfo=ZoneInfo("America/Vancouver"))
         with tempfile.TemporaryDirectory() as temporary_dir:
             service = self._service(temporary_dir)
             response = FakeFrameResponse(b"jpeg-bytes", current.timestamp())
             with patch.object(reporting.requests, "get", return_value=response) as get_frame:
                 first = service.capture_due(current)
                 second = service.capture_due(current)
+                response.headers["X-Receive-Time"] = str((current + timedelta(minutes=1)).timestamp())
+                third = service.capture_due(current + timedelta(minutes=1))
 
             self.assertEqual(first["status"], "ok")
             self.assertEqual(first["captured"], [0, 1])
             self.assertEqual(second["already_present"], [0, 1])
-            self.assertEqual(get_frame.call_count, 2)
+            self.assertEqual(third["captured"], [0, 1])
+            self.assertEqual(get_frame.call_count, 4)
             snapshots = service.list_snapshots("2026-08-18")
-            self.assertEqual(len(snapshots), 2)
+            self.assertEqual(len(snapshots), 4)
             self.assertTrue(all(item.slot_hour == 9 for item in snapshots))
+            self.assertEqual({item.slot_minute for item in snapshots}, {12, 13})
             self.assertTrue(all(item.image_path.read_bytes() == b"jpeg-bytes" for item in snapshots))
 
-    def test_capture_rejects_stale_frames_and_retries_same_hour(self):
+    def test_capture_rejects_stale_frames_and_retries_same_minute(self):
         current = datetime(2026, 8, 18, 10, 15, tzinfo=ZoneInfo("America/Vancouver"))
         with tempfile.TemporaryDirectory() as temporary_dir:
             service = self._service(
@@ -169,17 +174,28 @@ class ReportingTests(unittest.TestCase):
             self.assertEqual(second["captured"], [0])
             self.assertEqual(get_frame.call_count, 2)
 
-    def test_capture_window_includes_0900_and_1700(self):
+    def test_capture_runs_all_day_instead_of_only_working_hours(self):
         with tempfile.TemporaryDirectory() as temporary_dir:
-            service = self._service(temporary_dir)
+            service = self._service(
+                temporary_dir,
+                cameras={0: {"name": "North", "location": "A", "zone": "Zone A"}},
+            )
             timezone = ZoneInfo("America/Vancouver")
-            before = service.capture_due(datetime(2026, 8, 18, 8, 59, tzinfo=timezone))
-            after = service.capture_due(datetime(2026, 8, 18, 18, 0, tzinfo=timezone))
+            before_time = datetime(2026, 8, 18, 8, 59, tzinfo=timezone)
+            after_time = datetime(2026, 8, 18, 18, 0, tzinfo=timezone)
+            with patch.object(
+                reporting.requests,
+                "get",
+                side_effect=[
+                    FakeFrameResponse(b"early", before_time.timestamp()),
+                    FakeFrameResponse(b"late", after_time.timestamp()),
+                ],
+            ):
+                before = service.capture_due(before_time)
+                after = service.capture_due(after_time)
 
-            self.assertEqual(before["status"], "not_due")
-            self.assertEqual(after["status"], "not_due")
-            self.assertIn(9, service.scheduled_hours)
-            self.assertIn(17, service.scheduled_hours)
+            self.assertEqual(before["status"], "ok")
+            self.assertEqual(after["status"], "ok")
 
     def test_background_recorder_starts_once_and_stops_cleanly(self):
         outside_window = datetime(
@@ -202,19 +218,19 @@ class ReportingTests(unittest.TestCase):
             service.stop()
             self.assertFalse(service.is_running())
 
-    def test_report_uses_one_temporal_vision_call_per_camera_then_text_synthesis(self):
-        current = datetime(2026, 8, 18, 10, 0, tzinfo=ZoneInfo("America/Vancouver"))
+    def test_five_minute_report_uses_each_minute_per_camera_then_text_synthesis(self):
+        current = datetime(2026, 8, 18, 10, 5, 30, tzinfo=ZoneInfo("America/Vancouver"))
         client = FakeClient()
         with tempfile.TemporaryDirectory() as temporary_dir:
             service = self._service(temporary_dir, client=client)
-            for hour in (9, 10):
-                frame_time = current.replace(hour=hour).timestamp()
+            for minute in range(1, 6):
+                slot = current.replace(minute=minute, second=0)
                 with patch.object(
                     reporting.requests,
                     "get",
-                    return_value=FakeFrameResponse(b"image", frame_time),
+                    return_value=FakeFrameResponse(b"image", slot.timestamp()),
                 ):
-                    service.capture_due(current.replace(hour=hour))
+                    service.capture_due(slot)
 
             pdf_path = Path(temporary_dir) / "output" / "pdf" / "report.pdf"
             with patch.object(service, "_site_now", return_value=current), patch.object(
@@ -222,14 +238,16 @@ class ReportingTests(unittest.TestCase):
                 "_write_pdf",
                 return_value=pdf_path,
             ):
-                result = service.generate_daily_report(
-                    "2026-08-18",
+                result = service.generate_interval_report(
+                    5,
                     "Zone A",
-                    "Excavate and level Area B by the end of the day.",
+                    "Excavate and level Area B.",
+                    end_time=current,
                 )
 
             self.assertEqual(result["status"], "ok")
-            self.assertEqual(result["snapshot_count"], 4)
+            self.assertEqual(result["lookback_minutes"], 5)
+            self.assertEqual(result["snapshot_count"], 10)
             self.assertEqual(result["camera_count"], 2)
             self.assertEqual(len(client.responses.requests), 3)
             camera_requests = [
@@ -242,19 +260,19 @@ class ReportingTests(unittest.TestCase):
                 content = request["input"][0]["content"]
                 self.assertEqual(
                     sum(item["type"] == "input_image" for item in content),
-                    2,
+                    5,
                 )
                 prompt_text = " ".join(
                     item.get("text", "") for item in content if item["type"] == "input_text"
                 )
-                self.assertIn("09:00", prompt_text)
-                self.assertIn("10:00", prompt_text)
+                self.assertIn("10:01", prompt_text)
+                self.assertIn("10:05", prompt_text)
                 self.assertIn("Excavate and level Area B", prompt_text)
                 self.assertIn("Zone: Zone A", prompt_text)
             synthesis = next(
                 request
                 for request in client.responses.requests
-                if request["text"]["format"]["name"] == "daily_construction_progress_report"
+                if request["text"]["format"]["name"] == "construction_progress_interval_report"
             )
             self.assertEqual(
                 [item["type"] for item in synthesis["input"][0]["content"]],
@@ -282,7 +300,7 @@ class ReportingTests(unittest.TestCase):
                 "_write_pdf",
                 return_value=Path(temporary_dir) / "report.pdf",
             ):
-                result = service.generate_daily_report("2026-08-18", "Zone A")
+                result = service.generate_interval_report(1, "Zone A", end_time=current)
 
             self.assertEqual(result["status"], "ok")
             camera_request = client.responses.requests[0]
@@ -315,7 +333,7 @@ class ReportingTests(unittest.TestCase):
                 "_write_pdf",
                 return_value=Path(temporary_dir) / "zone-a.pdf",
             ):
-                result = service.generate_daily_report("2026-08-18", "Zone A")
+                result = service.generate_interval_report(1, "Zone A", end_time=current)
 
             self.assertEqual(result["zone"], "Zone A")
             self.assertEqual(result["camera_count"], 1)
@@ -330,9 +348,142 @@ class ReportingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_dir:
             service = self._service(temporary_dir)
             with self.assertRaisesRegex(ValueError, "zone is required"):
-                service.generate_daily_report("2026-08-18")
+                service.generate_interval_report(5)
             with self.assertRaisesRegex(ValueError, "Unknown zone"):
-                service.generate_daily_report("2026-08-18", "Moon Base")
+                service.generate_interval_report(5, "Moon Base")
+
+    def test_long_interval_evenly_limits_vlm_frames_but_keeps_full_coverage(self):
+        timezone = ZoneInfo("America/Vancouver")
+        end_time = datetime(2026, 8, 18, 12, 0, 30, tzinfo=timezone)
+        client = FakeClient()
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            service = self._service(
+                temporary_dir,
+                cameras={0: {"name": "North", "location": "A", "zone": "Zone A"}},
+                client=client,
+                max_frames_per_camera=12,
+            )
+            for offset in range(120):
+                slot = end_time.replace(second=0) - timedelta(minutes=119 - offset)
+                with patch.object(
+                    reporting.requests,
+                    "get",
+                    return_value=FakeFrameResponse(b"image", slot.timestamp()),
+                ):
+                    service.capture_due(slot)
+            with patch.object(service, "_site_now", return_value=end_time), patch.object(
+                service,
+                "_write_pdf",
+                return_value=Path(temporary_dir) / "report.pdf",
+            ):
+                result = service.generate_interval_report(120, "Zone A", end_time=end_time)
+
+            request = next(
+                item for item in client.responses.requests
+                if item["text"]["format"]["name"] == "camera_progress_observation"
+            )
+            content = request["input"][0]["content"]
+            self.assertEqual(sum(item["type"] == "input_image" for item in content), 12)
+            self.assertEqual(result["snapshot_count"], 120)
+            synthesis = next(
+                item for item in client.responses.requests
+                if item["text"]["format"]["name"] == "construction_progress_interval_report"
+            )
+            synthesis_prompt = synthesis["input"][0]["content"][0]["text"]
+            self.assertNotIn('"captured_times"', synthesis_prompt)
+            self.assertIn('"first_captured_time"', synthesis_prompt)
+            self.assertIn('"last_captured_time"', synthesis_prompt)
+            coverage = service.get_status(120, "Zone A", end_time=end_time)
+            self.assertEqual(coverage["camera_coverage"][0]["captured_count"], 120)
+            self.assertEqual(coverage["camera_coverage"][0]["expected_count"], 120)
+            self.assertLessEqual(len(coverage["camera_coverage"][0]["captured_times"]), 12)
+
+    def test_missing_minutes_reduce_coverage_without_preventing_report(self):
+        timezone = ZoneInfo("America/Vancouver")
+        end_time = datetime(2026, 8, 18, 10, 5, 30, tzinfo=timezone)
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            service = self._service(
+                temporary_dir,
+                cameras={0: {"name": "North", "location": "A", "zone": "Zone A"}},
+            )
+            for minute in (1, 3, 5):
+                slot = end_time.replace(minute=minute, second=0)
+                with patch.object(
+                    reporting.requests,
+                    "get",
+                    return_value=FakeFrameResponse(b"image", slot.timestamp()),
+                ):
+                    service.capture_due(slot)
+            with patch.object(service, "_site_now", return_value=end_time), patch.object(
+                service,
+                "_write_pdf",
+                return_value=Path(temporary_dir) / "report.pdf",
+            ):
+                result = service.generate_interval_report(5, "Zone A", end_time=end_time)
+
+            self.assertEqual(result["status"], "ok")
+            status = service.get_status(5, "Zone A", end_time=end_time)
+            self.assertEqual(status["camera_coverage"][0]["captured_count"], 3)
+            self.assertEqual(status["camera_coverage"][0]["expected_count"], 5)
+
+    def test_report_duration_validation(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            service = self._service(temporary_dir)
+            for duration in (0, -1, 10081, 2.5, None):
+                with self.subTest(duration=duration), self.assertRaises(ValueError):
+                    service.generate_interval_report(duration, "Zone A")
+
+    def test_exact_minute_boundary_still_selects_exact_requested_slot_count(self):
+        timezone = ZoneInfo("America/Vancouver")
+        end_time = datetime(2026, 8, 18, 10, 5, 0, tzinfo=timezone)
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            service = self._service(
+                temporary_dir,
+                cameras={0: {"name": "North", "location": "A", "zone": "Zone A"}},
+            )
+            for minute in range(6):
+                slot = end_time.replace(minute=minute)
+                with patch.object(
+                    reporting.requests,
+                    "get",
+                    return_value=FakeFrameResponse(b"image", slot.timestamp()),
+                ):
+                    service.capture_due(slot)
+
+            status = service.get_status(5, "Zone A", end_time=end_time)
+
+            self.assertEqual(status["expected_minute_count"], 5)
+            self.assertEqual(status["snapshot_count"], 5)
+            self.assertEqual(status["camera_coverage"][0]["expected_count"], 5)
+
+    def test_two_hour_interval_can_cross_midnight(self):
+        timezone = ZoneInfo("America/Vancouver")
+        end_time = datetime(2026, 8, 19, 0, 30, 30, tzinfo=timezone)
+        slots = [
+            datetime(2026, 8, 18, 23, 0, 0, tzinfo=timezone),
+            datetime(2026, 8, 19, 0, 30, 0, tzinfo=timezone),
+        ]
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            service = self._service(
+                temporary_dir,
+                cameras={0: {"name": "North", "location": "A", "zone": "Zone A"}},
+            )
+            for slot in slots:
+                with patch.object(
+                    reporting.requests,
+                    "get",
+                    return_value=FakeFrameResponse(b"image", slot.timestamp()),
+                ):
+                    service.capture_due(slot)
+
+            status = service.get_status(120, "Zone A", end_time=end_time)
+
+            self.assertEqual(status["snapshot_count"], 2)
+            self.assertEqual(status["camera_coverage"][0]["expected_count"], 120)
+            self.assertEqual(
+                status["camera_coverage"][0]["captured_times"],
+                ["08-18 23:00", "08-19 00:30"],
+            )
 
     def test_supervisor_generates_one_report_per_zone_without_changing_modes(self):
         zones = list(supervisor.ZONE_NAMES[:2])
@@ -346,17 +497,17 @@ class ReportingTests(unittest.TestCase):
         try:
             with patch.object(
                 supervisor.reporting_service,
-                "generate_daily_report",
-                side_effect=lambda report_date, zone, goal: {
+                "generate_interval_report",
+                side_effect=lambda lookback_minutes, zone, goal: {
                     "status": "ok",
                     "zone": zone,
                     "report_url": f"/reports/{zone.lower().replace(' ', '-')}.pdf",
                 },
             ) as generate:
                 result = supervisor.execute_supervisor_tool(
-                    "generate_daily_report",
+                    "generate_progress_report",
                     {
-                        "report_date": "2026-08-18",
+                        "lookback_minutes": 120,
                         "zones": zones,
                         "goal": "Level the work area",
                     },
@@ -366,7 +517,7 @@ class ReportingTests(unittest.TestCase):
             self.assertEqual([report["zone"] for report in result["reports"]], zones)
             self.assertEqual(generate.call_count, 2)
             for zone in zones:
-                generate.assert_any_call("2026-08-18", zone, "Level the work area")
+                generate.assert_any_call(120, zone, "Level the work area")
             with supervisor._operational_lock:
                 self.assertEqual(supervisor._zone_states, before)
         finally:

@@ -321,7 +321,8 @@ class OperationalModeTests(unittest.TestCase):
         self.assertIn("get_safety_state", tool_names)
         self.assertIn("clear_safety_hazard", tool_names)
         self.assertIn("get_reporting_status", tool_names)
-        self.assertIn("generate_daily_report", tool_names)
+        self.assertIn("generate_progress_report", tool_names)
+        self.assertNotIn("generate_daily_report", tool_names)
         self.assertNotIn("activate_emergency_mode", tool_names)
         self.assertEqual(realtime_config["tools"], supervisor.tools)
         for mode in ("free", "safety", "search", "investigation"):
@@ -337,9 +338,13 @@ class OperationalModeTests(unittest.TestCase):
             operational_tool["parameters"]["properties"]["zones"]["items"]["enum"],
             list(supervisor.ZONE_NAMES),
         )
-        report_tool = next(tool for tool in supervisor.tools if tool["name"] == "generate_daily_report")
-        self.assertIn("zones", report_tool["parameters"]["required"])
+        report_tool = next(tool for tool in supervisor.tools if tool["name"] == "generate_progress_report")
+        self.assertEqual(
+            report_tool["parameters"]["required"],
+            ["lookback_minutes", "zones"],
+        )
         self.assertIn("separate PDF", report_tool["description"])
+        self.assertIn("two hours is 120", supervisor.SYSTEM_PROMPT)
         self.assertIn("not an operational mode", supervisor.SYSTEM_PROMPT)
         self.assertIn("different zones can run different modes", supervisor.SYSTEM_PROMPT)
         self.assertIn("Never\n  change an unmentioned zone", supervisor.SYSTEM_PROMPT)

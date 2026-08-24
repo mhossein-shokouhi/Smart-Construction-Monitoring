@@ -53,11 +53,9 @@ REPORTING_VLM_MODEL = os.environ.get("OPENAI_REPORTING_VLM_MODEL", "gpt-5.6")
 REPORTING_VLM_DETAIL = os.environ.get("OPENAI_REPORTING_VLM_DETAIL", "high")
 REPORTING_REASONING_EFFORT = os.environ.get("OPENAI_REPORTING_REASONING_EFFORT", "medium")
 REPORTING_SITE_TIMEZONE = os.environ.get("REPORTING_SITE_TIMEZONE", SAFETY_SITE_TIMEZONE)
-REPORTING_CAPTURE_START_HOUR = int(os.environ.get("REPORTING_CAPTURE_START_HOUR", "9"))
-REPORTING_CAPTURE_END_HOUR = int(os.environ.get("REPORTING_CAPTURE_END_HOUR", "17"))
 REPORTING_CAPTURE_POLL_SEC = max(
     1.0,
-    float(os.environ.get("REPORTING_CAPTURE_POLL_SEC", "30")),
+    float(os.environ.get("REPORTING_CAPTURE_POLL_SEC", "10")),
 )
 REPORTING_MAX_FRAME_AGE_SEC = max(
     1.0,
@@ -66,6 +64,10 @@ REPORTING_MAX_FRAME_AGE_SEC = max(
 REPORTING_MAX_ANALYSIS_WORKERS = max(
     1,
     int(os.environ.get("REPORTING_MAX_ANALYSIS_WORKERS", "2")),
+)
+REPORTING_MAX_FRAMES_PER_CAMERA = max(
+    2,
+    int(os.environ.get("REPORTING_MAX_FRAMES_PER_CAMERA", "24")),
 )
 REPORTING_SNAPSHOT_DIR = os.environ.get("REPORTING_SNAPSHOT_DIR") or None
 REPORTING_OUTPUT_DIR = os.environ.get("REPORTING_OUTPUT_DIR") or None
@@ -348,11 +350,10 @@ reporting_service = ConstructionReporting(
     image_detail=REPORTING_VLM_DETAIL,
     reasoning_effort=REPORTING_REASONING_EFFORT,
     site_timezone=REPORTING_SITE_TIMEZONE,
-    capture_start_hour=REPORTING_CAPTURE_START_HOUR,
-    capture_end_hour=REPORTING_CAPTURE_END_HOUR,
     capture_poll_sec=REPORTING_CAPTURE_POLL_SEC,
     max_frame_age_sec=REPORTING_MAX_FRAME_AGE_SEC,
     max_analysis_workers=REPORTING_MAX_ANALYSIS_WORKERS,
+    max_frames_per_camera=REPORTING_MAX_FRAMES_PER_CAMERA,
     snapshot_root=REPORTING_SNAPSHOT_DIR,
     output_dir=REPORTING_OUTPUT_DIR,
     log_callback=_post_system_log,
@@ -360,7 +361,7 @@ reporting_service = ConstructionReporting(
 
 
 def start_reporting_recorder() -> None:
-    """Start passive hourly evidence capture once for the supervisor process."""
+    """Start passive minute-by-minute evidence capture once for the supervisor process."""
     reporting_service.start()
 
 
@@ -761,7 +762,7 @@ tools = [
             "for raw streaming and starts laptop-side VLM scanning for any visible target, including "
             "people, animals, vehicles, equipment, or other objects. Safety Mode configures cameras "
             "for raw streaming and scans each frame for construction hazards. Investigation Mode is "
-            "currently a selectable placeholder. Daily reporting is a separate background capability, "
+            "currently a selectable placeholder. Progress reporting is a separate background capability, "
             "not an operational mode."
         ),
         "parameters": {
@@ -838,15 +839,17 @@ tools = [
         "type": "function",
         "name": "get_reporting_status",
         "description": (
-            "Check hourly construction-report snapshot coverage for one or more zones without "
-            "changing operational mode. If date is omitted, use the current site-local date."
+            "Check minute-by-minute construction-report snapshot coverage for one or more zones "
+            "over a recent lookback interval without changing operational mode."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "report_date": {
-                    "type": "string",
-                    "description": "Optional date in YYYY-MM-DD format.",
+                "lookback_minutes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10080,
+                    "description": "Recent duration to inspect in minutes. Defaults to 60.",
                 },
                 "zones": {
                     "type": "array",
@@ -858,24 +861,26 @@ tools = [
     },
     {
         "type": "function",
-        "name": "generate_daily_report",
+        "name": "generate_progress_report",
         "description": (
             "Generate a separate PDF construction progress report for each requested zone from that "
-            "zone's hourly camera snapshots. This does not switch operational mode. Include the "
-            "operator's stated daily goal when provided. If date is omitted, use the current "
-            "site-local date."
+            "zone's minute-by-minute snapshots over a requested recent duration. This does not switch "
+            "operational mode. Convert hours to minutes, for example two hours is 120 minutes. Include "
+            "the operator's stated goal when provided."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "report_date": {
-                    "type": "string",
-                    "description": "Optional report date in YYYY-MM-DD format.",
+                "lookback_minutes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10080,
+                    "description": "How far back from now the report should cover, in whole minutes.",
                 },
                 "goal": {
                     "type": "string",
                     "description": (
-                        "Optional construction goal for that day, copied faithfully from the operator."
+                        "Optional construction goal for that interval, copied faithfully from the operator."
                     ),
                 },
                 "zones": {
@@ -884,7 +889,7 @@ tools = [
                     "description": "One or more zones; each receives its own PDF report.",
                 },
             },
-            "required": ["zones"],
+            "required": ["lookback_minutes", "zones"],
         },
     },
 ]
@@ -978,21 +983,20 @@ Behaviour rules:
 - Investigation Mode is a per-zone placeholder until its workflow is defined.
   Still call `set_operational_mode` when it is requested, then clearly explain that
   no automatic camera reconfiguration is configured for it yet.
-- Daily reporting is not an operational mode and never interrupts the active
+- Progress reporting is not an operational mode and never interrupts the active
   operational mode. A passive recorder saves one fresh frame per registered
-  camera at each hourly slot from {REPORTING_CAPTURE_START_HOUR:02d}:00 through
-  {REPORTING_CAPTURE_END_HOUR:02d}:00 in {REPORTING_SITE_TIMEZONE}. Use
-  `get_reporting_status` when asked what evidence is available for a date.
-- Use `generate_daily_report` when the operator asks for a daily construction
-  report. A zone is required. Pass every requested zone and create a separate
-  PDF for each. Pass the requested date in YYYY-MM-DD form; if the operator says
-  "today", omit the date so the site-local current date is used. Pass the
-  operator's goal exactly when one is provided. Do not ask for a goal because
-  it is optional. The tool compares each camera's ordered daily sequence,
+  camera during every clock minute, all day, in {REPORTING_SITE_TIMEZONE}. Use
+  `get_reporting_status` when asked what recent evidence is available.
+- Use `generate_progress_report` when the operator asks for a construction
+  report covering a recent duration. A zone and duration are required. Convert
+  spoken durations to whole minutes: five minutes is 5, two hours is 120, and
+  one day is 1440. Pass every requested zone and create a separate PDF for each.
+  Pass the operator's goal exactly when one is provided. Do not ask for a goal
+  because it is optional. The tool compares each camera's ordered interval sequence,
   synthesizes the camera observations, and creates a PDF. In text chat, present
   the returned `report_url` as a Markdown link. If someone asks to enter
   Reporting Mode, explain that reporting now runs in the background and ask
-  which zone and day they want instead of changing operational mode.
+  which zone and recent duration they want instead of changing operational mode.
 - If the operator asks to stop or cancel Search Mode without naming a next
   operational mode, switch the referenced zones to Free Mode. Ask which zone
   only when it cannot be inferred; do not stop Search in other zones.
@@ -1024,32 +1028,32 @@ Voice conversation rules:
 
 
 def get_reporting_status_for_zones(
-    report_date: Optional[str] = None,
+    lookback_minutes: int = 60,
     zones: Any = None,
 ) -> dict:
     selected_zones = _coerce_zone_names(zones)
     statuses = [
-        reporting_service.get_status(report_date, zone)
+        reporting_service.get_status(lookback_minutes, zone)
         for zone in selected_zones
     ]
     return {
         "status": "ok",
-        "date": statuses[0]["date"] if statuses else report_date,
+        "lookback_minutes": lookback_minutes,
         "zones": statuses,
         "message": f"Reporting coverage returned for {len(statuses)} zone(s).",
     }
 
 
-def generate_daily_reports_for_zones(
-    report_date: Optional[str],
+def generate_progress_reports_for_zones(
+    lookback_minutes: int,
     zones: Any,
     goal: Optional[str] = None,
 ) -> dict:
     if zones is None:
-        raise ValueError("At least one zone is required to generate a daily report.")
+        raise ValueError("At least one zone is required to generate a progress report.")
     selected_zones = _coerce_zone_names(zones)
     reports = [
-        reporting_service.generate_daily_report(report_date, zone, goal)
+        reporting_service.generate_interval_report(lookback_minutes, zone, goal)
         for zone in selected_zones
     ]
     ok_count = sum(report.get("status") == "ok" for report in reports)
@@ -1062,6 +1066,7 @@ def generate_daily_reports_for_zones(
         status = "error"
     result = {
         "status": status,
+        "lookback_minutes": lookback_minutes,
         "target_zones": selected_zones,
         "reports": reports,
         "message": (
@@ -1151,16 +1156,16 @@ def execute_supervisor_tool(tool_name: str, args: Any) -> dict:
     if tool_name == "get_reporting_status":
         try:
             return get_reporting_status_for_zones(
-                args.get("report_date"),
+                args.get("lookback_minutes", 60),
                 args.get("zones", args.get("zone")),
             )
         except ValueError as exc:
             return {"status": "error", "error": str(exc)}
 
-    if tool_name == "generate_daily_report":
+    if tool_name == "generate_progress_report":
         try:
-            return generate_daily_reports_for_zones(
-                args.get("report_date"),
+            return generate_progress_reports_for_zones(
+                args.get("lookback_minutes"),
                 args.get("zones", args.get("zone")),
                 args.get("goal"),
             )
@@ -1289,7 +1294,7 @@ def attach_voice_routes(app) -> None:
         return JSONResponse(state)
 
     @app.get("/reports/{filename}")
-    async def download_daily_report(filename: str):
+    async def download_progress_report(filename: str):
         report_path = reporting_service.resolve_report_path(filename)
         if report_path is None:
             return JSONResponse({"error": "Report not found."}, status_code=404)
