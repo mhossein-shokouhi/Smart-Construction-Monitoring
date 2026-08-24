@@ -123,8 +123,8 @@ class ReportingTests(unittest.TestCase):
             receiver_url="http://receiver",
             cameras=cameras
             or {
-                0: {"name": "North Camera", "location": "Area B"},
-                1: {"name": "South Camera", "location": "Area B"},
+                0: {"name": "North Camera", "location": "Area B", "zone": "Zone A"},
+                1: {"name": "South Camera", "location": "Area B", "zone": "Zone A"},
             },
             site_timezone="America/Vancouver",
             snapshot_root=Path(root) / "snapshots",
@@ -155,7 +155,7 @@ class ReportingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_dir:
             service = self._service(
                 temporary_dir,
-                cameras={0: {"name": "North Camera", "location": "Area B"}},
+                cameras={0: {"name": "North Camera", "location": "Area B", "zone": "Zone A"}},
             )
             stale = FakeFrameResponse(b"old", current.timestamp() - 60)
             fresh = FakeFrameResponse(b"new", current.timestamp())
@@ -224,6 +224,7 @@ class ReportingTests(unittest.TestCase):
             ):
                 result = service.generate_daily_report(
                     "2026-08-18",
+                    "Zone A",
                     "Excavate and level Area B by the end of the day.",
                 )
 
@@ -249,6 +250,7 @@ class ReportingTests(unittest.TestCase):
                 self.assertIn("09:00", prompt_text)
                 self.assertIn("10:00", prompt_text)
                 self.assertIn("Excavate and level Area B", prompt_text)
+                self.assertIn("Zone: Zone A", prompt_text)
             synthesis = next(
                 request
                 for request in client.responses.requests
@@ -265,7 +267,7 @@ class ReportingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_dir:
             service = self._service(
                 temporary_dir,
-                cameras={0: {"name": "North Camera", "location": "Area B"}},
+                cameras={0: {"name": "North Camera", "location": "Area B", "zone": "Zone A"}},
                 client=client,
             )
             with patch.object(
@@ -280,35 +282,95 @@ class ReportingTests(unittest.TestCase):
                 "_write_pdf",
                 return_value=Path(temporary_dir) / "report.pdf",
             ):
-                result = service.generate_daily_report("2026-08-18")
+                result = service.generate_daily_report("2026-08-18", "Zone A")
 
             self.assertEqual(result["status"], "ok")
             camera_request = client.responses.requests[0]
             prompt = camera_request["input"][0]["content"][0]["text"]
             self.assertIn("use -1", prompt)
 
-    def test_supervisor_reporting_tool_does_not_change_operational_mode(self):
-        with supervisor._operational_lock:
-            supervisor._operational_state.update(mode="safety", objective=None)
-        expected = {
-            "status": "ok",
-            "report_url": "/reports/construction-progress-2026-08-18.pdf",
-        }
-        with patch.object(
-            supervisor.reporting_service,
-            "generate_daily_report",
-            return_value=expected,
-        ) as generate:
-            result = supervisor.execute_supervisor_tool(
-                "generate_daily_report",
-                {"report_date": "2026-08-18", "goal": "Level Area B"},
+    def test_zone_filter_keeps_other_zone_frames_out_of_report(self):
+        current = datetime(2026, 8, 18, 9, 0, tzinfo=ZoneInfo("America/Vancouver"))
+        client = FakeClient()
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            service = self._service(
+                temporary_dir,
+                cameras={
+                    0: {"name": "North", "location": "A", "zone": "Zone A"},
+                    1: {"name": "South", "location": "B", "zone": "Zone B"},
+                },
+                client=client,
             )
+            with patch.object(
+                reporting.requests,
+                "get",
+                return_value=FakeFrameResponse(b"image", current.timestamp()),
+            ):
+                service.capture_due(current)
 
-        self.assertEqual(result, expected)
-        self.assertEqual(supervisor.get_operational_mode_tool()["mode"], "safety")
-        generate.assert_called_once_with("2026-08-18", "Level Area B")
+            self.assertEqual(len(service.list_snapshots("2026-08-18", "Zone A")), 1)
+            self.assertEqual(len(service.list_snapshots("2026-08-18", "Zone B")), 1)
+            with patch.object(service, "_site_now", return_value=current), patch.object(
+                service,
+                "_write_pdf",
+                return_value=Path(temporary_dir) / "zone-a.pdf",
+            ):
+                result = service.generate_daily_report("2026-08-18", "Zone A")
+
+            self.assertEqual(result["zone"], "Zone A")
+            self.assertEqual(result["camera_count"], 1)
+            vision_requests = [
+                request for request in client.responses.requests
+                if request["text"]["format"]["name"] == "camera_progress_observation"
+            ]
+            self.assertEqual(len(vision_requests), 1)
+            self.assertIn("Camera: North", vision_requests[0]["input"][0]["content"][0]["text"])
+
+    def test_report_requires_a_known_zone(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            service = self._service(temporary_dir)
+            with self.assertRaisesRegex(ValueError, "zone is required"):
+                service.generate_daily_report("2026-08-18")
+            with self.assertRaisesRegex(ValueError, "Unknown zone"):
+                service.generate_daily_report("2026-08-18", "Moon Base")
+
+    def test_supervisor_generates_one_report_per_zone_without_changing_modes(self):
+        zones = list(supervisor.ZONE_NAMES[:2])
+        original_states = supervisor._zone_states
+        supervisor._zone_states = {
+            zone: {"mode": "safety" if zone == zones[0] else "free", "objective": None}
+            for zone in supervisor.ZONE_NAMES
+        }
         with supervisor._operational_lock:
-            supervisor._operational_state.update(mode="free", objective=None)
+            before = {zone: dict(state) for zone, state in supervisor._zone_states.items()}
+        try:
+            with patch.object(
+                supervisor.reporting_service,
+                "generate_daily_report",
+                side_effect=lambda report_date, zone, goal: {
+                    "status": "ok",
+                    "zone": zone,
+                    "report_url": f"/reports/{zone.lower().replace(' ', '-')}.pdf",
+                },
+            ) as generate:
+                result = supervisor.execute_supervisor_tool(
+                    "generate_daily_report",
+                    {
+                        "report_date": "2026-08-18",
+                        "zones": zones,
+                        "goal": "Level the work area",
+                    },
+                )
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual([report["zone"] for report in result["reports"]], zones)
+            self.assertEqual(generate.call_count, 2)
+            for zone in zones:
+                generate.assert_any_call("2026-08-18", zone, "Level the work area")
+            with supervisor._operational_lock:
+                self.assertEqual(supervisor._zone_states, before)
+        finally:
+            supervisor._zone_states = original_states
 
 
 if __name__ == "__main__":

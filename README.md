@@ -2,7 +2,8 @@
 
 An AI-agent–based orchestration system for coordinating a network of edge-AI
 smart cameras. A natural-language **supervisor agent** on the operator's laptop
-interprets high-level objectives, selects a fleet-wide operational mode, and
+interprets high-level objectives, selects operational modes for one or more
+construction zones, and
 reconfigures Raspberry Pi–backed cameras in real time. Video is streamed back
 to the laptop and displayed in a single dashboard.
 
@@ -55,7 +56,7 @@ case, Rogers 5G).
 | `raw_stream_demo.py` | Default-mode pipeline (raw Picamera2 stream, no inference overlays) |
 | `object_detection_demo.py` | Surveillance-mode pipeline (IMX500 object detection) |
 | `segmentation_demo_overlay.py` | Construction-mode pipeline (IMX500 semantic segmentation) |
-| `cameras.json` | Registry of cameras → Pi hosts / ports |
+| `cameras.json` | Registry of cameras → zones, Pi hosts, and ports |
 | `models/` | IMX500 `.rpk` network packages used by the demos |
 | `assets/` | Label files and colour palette for the demos |
 | `performance_metrics/ping_metrics.py` | Helper script for measuring RTT / jitter on the network link |
@@ -86,14 +87,16 @@ case, Rogers 5G).
 ## 1 · Configure the camera registry
 
 Edit `cameras.json` so it describes every camera in your deployment. Each
-entry's `pi_host` / `pi_port` must point at the Raspberry Pi that hosts that
-camera:
+entry's `zone` is the operator-facing construction zone containing that camera,
+and `pi_host` / `pi_port` must point at the Raspberry Pi that hosts it. Several
+cameras may share the same zone:
 
 ```json
 {
   "cameras": [
-    { "id": 0, "name": "Camera 0", "location": "Front Gate", "pi_host": "192.168.1.50", "pi_port": 8000 },
-    { "id": 1, "name": "Camera 1", "location": "Warehouse",  "pi_host": "192.168.1.51", "pi_port": 8000 }
+    { "id": 0, "name": "Camera 0", "location": "North", "zone": "Excavation", "pi_host": "192.168.1.50", "pi_port": 8000 },
+    { "id": 1, "name": "Camera 1", "location": "South", "zone": "Excavation", "pi_host": "192.168.1.51", "pi_port": 8000 },
+    { "id": 2, "name": "Camera 2", "location": "Gate", "zone": "Entrance", "pi_host": "192.168.1.52", "pi_port": 8000 }
   ]
 }
 ```
@@ -183,14 +186,15 @@ the supervisor in plain English:
 - *"Switch the warehouse camera to construction mode."*
 - *"What is camera 1 currently doing?"*
 - *"Set all cameras to idle."*
-- *"Enter Search Mode and find a red fire extinguisher."*
-- *"Search all cameras for a child wearing a blue jacket."*
-- *"Stop Search Mode and return to Free Mode."*
-- *"Enter Safety Mode."*
+- *"Put the Excavation zone in Search Mode and find a red fire extinguisher."*
+- *"Search all zones for a child wearing a blue jacket."*
+- *"Stop Search Mode in the Excavation zone and return it to Free Mode."*
+- *"Put the Excavation and Entrance zones in Safety Mode."*
 - *"Is the construction site currently clear?"*
 - *"Clear the safety hazard; the area has been inspected."*
-- *"Generate today's construction progress report. Our goal was to excavate and level Area B."*
-- *"How many reporting snapshots were captured for August 18?"*
+- *"Generate today's report for the Excavation zone. Our goal was to excavate and level Area B."*
+- *"Generate separate reports for the Excavation and Entrance zones for August 18."*
+- *"How many reporting snapshots were captured for the Excavation zone on August 18?"*
 
 The supervisor translates each request into the right HTTP call to the
 corresponding Pi, reports back in natural language, and the dashboard updates
@@ -205,9 +209,9 @@ microphone access, and speak commands such as:
 - *"Switch the front gate camera to default mode."*
 - *"What cameras are available?"*
 - *"Set the front gate camera back to idle."*
-- *"Enter Search Mode and find the red fire extinguisher."*
-- *"Generate today's construction progress report."*
-- *"Switch to Investigation Mode."*
+- *"Put the Excavation zone in Search Mode and find the red fire extinguisher."*
+- *"Generate today's construction progress report for the Excavation zone."*
+- *"Switch the Entrance zone to Investigation Mode."*
 
 Voice chat uses OpenAI's Realtime API over WebRTC. The browser sends microphone
 audio directly through a peer connection and receives natural spoken audio back;
@@ -262,16 +266,24 @@ allow microphone capture.
 All modes are selectable from the supervisor prompt — you never need to
 SSH into a Pi to change them.
 
-## Fleet-wide operational modes
+## Zone operational modes
+
+Every camera belongs to exactly one zone according to `cameras.json`. Each zone
+has its own mode and objective, so one zone can run Safety while another runs a
+Search for a specific object and the remaining zones stay in Free. A command can
+target one zone, several named zones, or all zones. Only cameras in the selected
+zones are normalized or scanned; unmentioned zones keep their existing state.
+The dashboard shows a card for every zone and labels the overall state **Mixed**
+when their modes differ.
 
 | Mode | Behaviour |
 | --- | --- |
-| `free` | Initial live-view mode. Stops Search and Safety scanning and sets every reachable camera to raw `default` streaming without running an automated scanner or workflow. A previously latched safety hazard remains visible until explicitly cleared. |
-| `safety` | Configures every reachable camera for raw `default` streaming and continuously checks each sampled frame for the applicable construction safety hazards in one VLM request. |
-| `search` | Configures every reachable camera for raw `default` streaming and scans all active feeds for the operator's visual target. The target can be a person, animal, vehicle, piece of equipment, or any other visibly identifiable object. |
+| `free` | Initial live-view mode. Stops Search and Safety scanning in that zone and sets its reachable cameras to raw `default` streaming without an automated scanner or workflow. A previously latched safety hazard remains visible until explicitly cleared. |
+| `safety` | Configures that zone's reachable cameras for raw `default` streaming and continuously checks each sampled frame for the applicable construction safety hazards in one VLM request. |
+| `search` | Configures that zone's reachable cameras for raw `default` streaming and scans its active feeds for the operator's visual target. Different zones can use different targets. |
 | `investigation` | Selectable placeholder. Its investigation workflow will be added when requirements are finalized. |
 
-Search Mode reuses the proven fleet-wide visual-search workflow. The scanner
+Search Mode reuses the proven visual-search workflow within each selected zone. Its scanner
 asks the receiver which streams are live, samples the latest frame from each
 active camera on every pass, and sends those frames to the configured VLM with
 the operator's target description. Camera feeds remain visible in the receiver
@@ -280,7 +292,7 @@ dashboard. When the VLM reports a match above the configured threshold, the
 and plays an alarm sound in the browser. Search Mode and match indicators use
 neutral blue/teal styling instead of critical-state red.
 
-Safety Mode uses the same fleet-wide stream sampling foundation but evaluates
+Safety Mode uses the same zone-filtered stream sampling foundation but evaluates
 exactly two applicable safety checks together. During configured construction
 hours, each frame is assessed for:
 
@@ -304,17 +316,17 @@ the operator switches modes or clears the System Log. It returns to green only
 when the operator explicitly asks the supervisor to clear or acknowledge the
 safety state. A new visible hazard can latch it red again.
 
-The system starts in Free Mode. Entering Free Mode stops any active Search or Safety scan,
-clears its objective, and normalizes all registered cameras to `default`
-processing for an unprocessed fleet-wide footage view. It does not run a VLM
+Every zone starts in Free Mode. Entering Free Mode for selected zones stops their
+active Search or Safety scans, clears their objectives, and normalizes only their
+registered cameras to `default` processing for an unprocessed footage view. It does not run a VLM
 scanner or any other operational workflow, and it does not silently clear a
 latched construction hazard.
 
 Investigation is intentionally an honest placeholder: selecting it updates the
 operational state and stops any active Search or Safety scan, but does not invent
 or apply camera configuration until that mode's detailed requirements are
-defined. Per-camera processing modes remain independently available whenever
-neither Search nor Safety Mode is active.
+defined. A per-camera processing mode remains available whenever that camera's
+own zone is not in Search or Safety Mode.
 
 ## Daily construction reporting
 
@@ -327,15 +339,16 @@ frame is stale, the recorder retries during that same hour. Each camera and hour
 is stored only once. The evidence is placed under the operating system's temporary
 directory by default; use `REPORTING_SNAPSHOT_DIR` to choose another location.
 
-When the operator asks for a report for a date, the system uses a compact two-stage
-analysis:
+When the operator asks for a report, at least one zone must be named. The system
+generates a separate PDF for every requested zone and never mixes another zone's
+frames into it. It uses a compact two-stage analysis for each zone:
 
 1. Each camera's ordered snapshots are sent together in one multimodal VLM request,
    with the camera name and capture time immediately before each image. The model
    returns structured activities, visible changes, progress estimates, issues, and
    confidence for that camera.
-2. One text-only synthesis request combines those camera observations, removes
-   duplicate views of the same work, and creates the site-wide narrative. The
+2. One text-only synthesis request combines that zone's camera observations, removes
+   duplicate views of the same work, and creates the zone narrative. The
    laptop then lays out a downloadable PDF with the summary, timeline, issues,
    evidence coverage, and representative first/last frames.
 
@@ -346,9 +359,11 @@ agent memory. If the operator includes the day's goal, the report can estimate
 progress toward it. Without a goal, the prompt explicitly prevents an invented
 completion percentage and reports only visible activity and change.
 
-Generated PDFs are saved under `output/pdf` and served from the supervisor at
-`/reports/<filename>`. A report can be requested while any operational mode is
-active.
+Generated PDFs use zone-specific filenames, are saved under `output/pdf`, and
+are served from the supervisor at `/reports/<filename>`. Missing cameras or
+timestamps reduce evidence coverage but do not stop a report as long as at least
+one valid snapshot in the requested zone can be analyzed. A report can be
+requested while any operational mode is active.
 
 ---
 

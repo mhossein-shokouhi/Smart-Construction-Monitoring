@@ -81,29 +81,35 @@ class FakeClient:
 
 class OperationalModeTests(unittest.TestCase):
     def setUp(self):
-        self.scanner = FakeSearchScanner()
-        self.safety_scanner = FakeSafetyScanner()
-        self.scanner_patch = patch.object(supervisor, "search_scanner", self.scanner)
-        self.safety_scanner_patch = patch.object(
-            supervisor,
-            "safety_scanner",
-            self.safety_scanner,
-        )
-        self.scanner_patch.start()
-        self.safety_scanner_patch.start()
+        self.original_search_scanners = supervisor.search_scanners
+        self.original_safety_scanners = supervisor.safety_scanners
+        self.original_zone_states = supervisor._zone_states
+        self.search = {zone: FakeSearchScanner() for zone in supervisor.ZONE_NAMES}
+        self.safety = {zone: FakeSafetyScanner() for zone in supervisor.ZONE_NAMES}
+        supervisor.search_scanners = self.search
+        supervisor.safety_scanners = self.safety
+        supervisor._zone_states = {
+            zone: {"mode": "free", "objective": None}
+            for zone in supervisor.ZONE_NAMES
+        }
+        self.zone_a, self.zone_b = supervisor.ZONE_NAMES[:2]
+        self.camera_a = supervisor.ZONES[self.zone_a][0]
+        self.camera_b = supervisor.ZONES[self.zone_b][0]
         with supervisor._operational_lock:
-            supervisor._operational_state.update(mode="free", objective=None)
+            for state in supervisor._zone_states.values():
+                state.update(mode="free", objective=None)
 
     def tearDown(self):
-        self.safety_scanner_patch.stop()
-        self.scanner_patch.stop()
+        supervisor.search_scanners = self.original_search_scanners
+        supervisor.safety_scanners = self.original_safety_scanners
+        supervisor._zone_states = self.original_zone_states
 
     def test_search_requires_a_target_without_changing_mode(self):
-        result = supervisor.set_operational_mode("search")
+        result = supervisor.set_operational_mode("search", zones=[self.zone_a])
 
         self.assertEqual(result["status"], "error")
         self.assertIn("requires", result["error"])
-        self.assertEqual(supervisor.get_operational_mode_tool()["mode"], "free")
+        self.assertEqual(supervisor.get_operational_mode_tool(self.zone_a)["mode"], "free")
 
     def test_reporting_is_not_an_operational_mode(self):
         result = supervisor.set_operational_mode("reporting")
@@ -115,249 +121,135 @@ class OperationalModeTests(unittest.TestCase):
 
     @patch.object(supervisor, "_post_receiver_json", return_value=True)
     @patch.object(supervisor, "call_pi_set_mode")
-    def test_free_stops_search_and_normalizes_every_camera(self, set_mode, post_json):
+    def test_search_only_configures_and_starts_the_requested_zone(self, set_mode, post_json):
         set_mode.side_effect = lambda camera_id, mode: {
             "status": "ok",
             "camera_id": camera_id,
             "mode": mode,
         }
-        self.scanner.running = True
-        with supervisor._operational_lock:
-            supervisor._operational_state.update(
-                mode="search",
-                objective="red fire extinguisher",
-            )
-
-        result = supervisor.set_operational_mode("free", "ignored objective")
-
-        self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["mode"], "free")
-        self.assertIsNone(result["objective"])
-        self.assertFalse(result["scanner_running"])
-        self.assertFalse(result["placeholder"])
-        self.assertTrue(result["receiver_synced"])
-        self.assertEqual(self.scanner.stop_count, 1)
-        self.assertCountEqual(
-            [call.args for call in set_mode.call_args_list],
-            [(camera_id, "default") for camera_id in supervisor.CAMERAS],
+        result = supervisor.set_operational_mode(
+            "search",
+            "red fire extinguisher",
+            [self.zone_a],
         )
-        state_payloads = [
-            call.args[1]
-            for call in post_json.call_args_list
-            if call.args[0] == "/system/state"
-        ]
-        self.assertEqual(state_payloads[-1]["mode"], "free")
-        self.assertIsNone(state_payloads[-1]["objective"])
-        self.assertFalse(state_payloads[-1]["scanner_running"])
-        self.assertFalse(state_payloads[-1]["placeholder"])
-
-    @patch.object(supervisor, "_post_receiver_json", return_value=True)
-    @patch.object(supervisor, "call_pi_set_mode")
-    def test_free_reports_partial_camera_normalization(self, set_mode, _post):
-        failed_camera_id = min(supervisor.CAMERAS)
-
-        def set_default(camera_id, mode):
-            if camera_id == failed_camera_id:
-                return {"status": "error", "error": "offline"}
-            return {"status": "ok", "camera_id": camera_id, "mode": mode}
-
-        set_mode.side_effect = set_default
-        result = supervisor.set_operational_mode("free")
-
-        self.assertEqual(result["status"], "partial_error")
-        self.assertEqual(result["mode"], "free")
-        self.assertFalse(result["scanner_running"])
-        self.assertIn(str(failed_camera_id), result["message"])
-        self.assertEqual(len(result["camera_results"]), len(supervisor.CAMERAS))
-
-    @patch.object(supervisor, "call_pi_set_mode", return_value={"status": "ok"})
-    def test_free_receiver_recovery_never_restarts_search(self, _set_mode):
-        self.scanner.running = True
-        with supervisor._operational_lock:
-            supervisor._operational_state.update(
-                mode="search",
-                objective="blue backpack",
-            )
-
-        with patch.object(supervisor, "_post_receiver_json", return_value=False):
-            result = supervisor.set_operational_mode("free")
-
-        self.assertEqual(result["status"], "partial_error")
-        self.assertFalse(result["receiver_synced"])
-        self.assertFalse(self.scanner.running)
-
-        with patch.object(supervisor, "_post_receiver_json", return_value=True):
-            self.assertTrue(supervisor._reconcile_operational_state())
-
-        self.assertFalse(self.scanner.running)
-        self.assertEqual(self.scanner.started_targets, [])
-
-    @patch.object(supervisor, "_post_receiver_json")
-    @patch.object(supervisor, "call_pi_set_mode")
-    def test_search_configures_every_camera_and_starts_scanner(self, set_mode, post_json):
-        set_mode.side_effect = lambda camera_id, mode: {
-            "status": "ok",
-            "camera_id": camera_id,
-            "mode": mode,
-        }
-
-        result = supervisor.set_operational_mode("search", "red fire extinguisher")
 
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["mode"], "search")
+        self.assertEqual(result["target_zones"], [self.zone_a])
+        self.assertTrue(result["scanner_running"])
         self.assertFalse(result["placeholder"])
-        self.assertEqual(self.scanner.started_targets, ["red fire extinguisher"])
+        self.assertEqual(self.search[self.zone_a].started_targets, ["red fire extinguisher"])
+        self.assertEqual(self.search[self.zone_b].started_targets, [])
         self.assertCountEqual(
             [call.args for call in set_mode.call_args_list],
-            [(camera_id, "default") for camera_id in supervisor.CAMERAS],
+            [(camera_id, "default") for camera_id in supervisor.ZONES[self.zone_a]],
         )
         state_payloads = [
             call.args[1]
             for call in post_json.call_args_list
             if call.args[0] == "/system/state"
         ]
-        self.assertEqual(state_payloads[-1]["mode"], "search")
-        self.assertEqual(state_payloads[-1]["objective"], "red fire extinguisher")
-        self.assertTrue(state_payloads[-1]["scanner_running"])
+        self.assertEqual(state_payloads[-1]["mode"], "mixed")
+        zone_states = {state["zone"]: state for state in state_payloads[-1]["zones"]}
+        self.assertEqual(zone_states[self.zone_a]["mode"], "search")
+        self.assertTrue(zone_states[self.zone_a]["scanner_running"])
+        self.assertEqual(zone_states[self.zone_b]["mode"], "free")
 
-    @patch.object(supervisor, "_post_receiver_json")
+    @patch.object(supervisor, "_post_receiver_json", return_value=True)
+    @patch.object(supervisor, "call_pi_set_mode")
+    def test_two_zones_can_run_different_modes_at_the_same_time(self, set_mode, _post):
+        set_mode.return_value = {"status": "ok"}
+        search_result = supervisor.set_operational_mode(
+            "search", "yellow hard hat", [self.zone_a]
+        )
+        safety_result = supervisor.set_operational_mode("safety", zones=[self.zone_b])
+
+        self.assertEqual(search_result["status"], "ok")
+        self.assertEqual(safety_result["status"], "ok")
+        state = supervisor.get_operational_mode_tool()
+        self.assertEqual(state["mode"], "mixed")
+        by_zone = {item["zone"]: item for item in state["zones"]}
+        self.assertEqual(by_zone[self.zone_a]["mode"], "search")
+        self.assertEqual(by_zone[self.zone_a]["objective"], "yellow hard hat")
+        self.assertEqual(by_zone[self.zone_b]["mode"], "safety")
+        self.assertTrue(self.search[self.zone_a].running)
+        self.assertTrue(self.safety[self.zone_b].running)
+        self.assertTrue(self.search[self.zone_a].running)
+
+    @patch.object(supervisor, "_post_receiver_json", return_value=True)
     @patch.object(supervisor, "call_pi_set_mode", return_value={"status": "ok"})
-    def test_active_search_retargets_after_publishing_new_objective(self, set_mode, post_json):
-        supervisor.set_operational_mode("search", "blue backpack")
-        set_mode.reset_mock()
-        state_events = []
+    def test_changing_one_zone_does_not_stop_another_zone(self, _set_mode, _post):
+        supervisor.set_operational_mode("search", "blue backpack", [self.zone_a])
+        supervisor.set_operational_mode("safety", zones=[self.zone_b])
+        zone_b_stops = self.safety[self.zone_b].stop_count
 
-        original_start = self.scanner.start
-        original_stop = self.scanner.stop
+        result = supervisor.set_operational_mode("free", zones=[self.zone_a])
 
-        def record_start(target):
-            state_events.append(("start", target))
-            original_start(target)
-
-        def record_stop():
-            state_events.append(("stop", None))
-            original_stop()
-
-        def record_post(path, payload, **_kwargs):
-            if path == "/system/state":
-                state_events.append(
-                    ("publish", payload["objective"], payload["scanner_running"])
-                )
-            return {"status": "ok"}
-
-        self.scanner.start = record_start
-        self.scanner.stop = record_stop
-        post_json.side_effect = record_post
-        supervisor.set_operational_mode("search", "yellow hard hat")
-
+        self.assertEqual(result["status"], "ok")
+        self.assertFalse(self.search[self.zone_a].running)
+        self.assertTrue(self.safety[self.zone_b].running)
+        self.assertEqual(self.safety[self.zone_b].stop_count, zone_b_stops)
         self.assertEqual(
-            state_events,
-            [
-                ("stop", None),
-                ("publish", "yellow hard hat", False),
-                ("publish", "yellow hard hat", False),
-                ("start", "yellow hard hat"),
-                ("publish", "yellow hard hat", True),
-            ],
+            supervisor.get_operational_mode_tool(self.zone_b)["mode"],
+            "safety",
         )
-        self.assertCountEqual(
-            [call.args for call in set_mode.call_args_list],
-            [(camera_id, "default") for camera_id in supervisor.CAMERAS],
-        )
-        self.assertEqual(
-            supervisor.get_operational_mode_tool()["objective"],
-            "yellow hard hat",
-        )
+
+    @patch.object(supervisor, "_post_receiver_json", return_value=True)
+    @patch.object(supervisor, "call_pi_set_mode", return_value={"status": "ok"})
+    def test_different_zones_can_have_different_search_targets(self, _set_mode, _post):
+        supervisor.set_operational_mode("search", "blue backpack", [self.zone_a])
+        supervisor.set_operational_mode("search", "red extinguisher", [self.zone_b])
+
+        self.assertEqual(self.search[self.zone_a].started_targets, ["blue backpack"])
+        self.assertEqual(self.search[self.zone_b].started_targets, ["red extinguisher"])
+        state = supervisor.get_operational_mode_tool([self.zone_a, self.zone_b])
+        self.assertEqual(state["mode"], "search")
+        self.assertIsNone(state["objective"])
+
+    def test_unknown_zone_is_rejected_without_changing_any_zone(self):
+        result = supervisor.set_operational_mode("safety", zones=["Moon Base"])
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("Unknown zone", result["error"])
+        self.assertEqual(supervisor.get_operational_mode_tool()["mode"], "free")
 
     @patch.object(supervisor, "call_pi_set_mode", return_value={"status": "ok"})
-    def test_search_waits_for_receiver_sync_and_recovers_automatically(self, _set_mode):
+    def test_search_waits_for_receiver_sync_and_recovers_per_zone(self, _set_mode):
         with patch.object(supervisor, "_post_receiver_json", return_value=False):
-            result = supervisor.set_operational_mode("search", "blue backpack")
+            result = supervisor.set_operational_mode(
+                "search", "blue backpack", [self.zone_a]
+            )
 
         self.assertEqual(result["status"], "partial_error")
         self.assertFalse(result["receiver_synced"])
-        self.assertFalse(self.scanner.running)
+        self.assertFalse(self.search[self.zone_a].running)
 
         with patch.object(supervisor, "_post_receiver_json", return_value=True):
             self.assertTrue(supervisor._reconcile_operational_state())
 
-        self.assertTrue(self.scanner.running)
-        self.assertEqual(self.scanner.started_targets, ["blue backpack"])
-
-    @patch.object(supervisor, "call_pi_set_mode", return_value={"status": "ok"})
-    def test_search_reports_pending_running_status_without_stopping_scanner(self, _set_mode):
-        state_results = iter([True, True, False])
-
-        def post_with_failed_running_state(path, _payload):
-            if path == "/system/state":
-                return next(state_results)
-            return True
-
-        with patch.object(
-            supervisor,
-            "_post_receiver_json",
-            side_effect=post_with_failed_running_state,
-        ):
-            result = supervisor.set_operational_mode("search", "blue backpack")
-
-        self.assertEqual(result["status"], "partial_error")
-        self.assertFalse(result["receiver_synced"])
-        self.assertTrue(result["scanner_running"])
-        self.assertTrue(self.scanner.running)
-        self.assertIn("status update is pending", result["message"])
+        self.assertTrue(self.search[self.zone_a].running)
+        self.assertEqual(self.search[self.zone_a].started_targets, ["blue backpack"])
+        self.assertFalse(self.search[self.zone_b].running)
 
     @patch.object(supervisor, "_post_receiver_json", return_value=True)
-    @patch.object(supervisor, "call_pi_set_mode")
-    def test_safety_configures_every_camera_and_starts_one_pass_scanner(
-        self,
-        set_mode,
-        post_json,
-    ):
-        set_mode.side_effect = lambda camera_id, mode: {
-            "status": "ok",
-            "camera_id": camera_id,
-            "mode": mode,
-        }
-
-        result = supervisor.set_operational_mode("safety", "ignored objective")
+    @patch.object(supervisor, "call_pi_set_mode", return_value={"status": "ok"})
+    def test_safety_starts_only_for_requested_zone(self, set_mode, _post):
+        result = supervisor.set_operational_mode("safety", zones=[self.zone_b])
 
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["mode"], "safety")
         self.assertIsNone(result["objective"])
-        self.assertFalse(result["placeholder"])
         self.assertTrue(result["scanner_running"])
-        self.assertEqual(self.safety_scanner.start_count, 1)
-        self.assertEqual(self.scanner.stop_count, 1)
+        self.assertEqual(self.safety[self.zone_b].start_count, 1)
+        self.assertEqual(self.safety[self.zone_a].start_count, 0)
         self.assertCountEqual(
             [call.args for call in set_mode.call_args_list],
-            [(camera_id, "default") for camera_id in supervisor.CAMERAS],
+            [(camera_id, "default") for camera_id in supervisor.ZONES[self.zone_b]],
         )
-        state_payloads = [
-            call.args[1]
-            for call in post_json.call_args_list
-            if call.args[0] == "/system/state"
-        ]
-        self.assertFalse(state_payloads[0]["scanner_running"])
-        self.assertTrue(state_payloads[-1]["scanner_running"])
-
-    @patch.object(supervisor, "call_pi_set_mode", return_value={"status": "ok"})
-    def test_safety_waits_for_receiver_sync_and_recovers_automatically(self, _set_mode):
-        with patch.object(supervisor, "_post_receiver_json", return_value=False):
-            result = supervisor.set_operational_mode("safety")
-
-        self.assertEqual(result["status"], "partial_error")
-        self.assertFalse(result["receiver_synced"])
-        self.assertFalse(self.safety_scanner.running)
-
-        with patch.object(supervisor, "_post_receiver_json", return_value=True):
-            self.assertTrue(supervisor._reconcile_operational_state())
-
-        self.assertTrue(self.safety_scanner.running)
-        self.assertEqual(self.safety_scanner.start_count, 1)
 
     def test_operator_clear_tool_does_not_change_operational_mode(self):
         with supervisor._operational_lock:
-            supervisor._operational_state.update(mode="safety", objective=None)
+            supervisor._zone_states[self.zone_a].update(mode="safety", objective=None)
 
         with patch.object(supervisor, "_post_receiver_json", return_value=True) as post_json:
             result = supervisor.execute_supervisor_tool(
@@ -367,86 +259,58 @@ class OperationalModeTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["safety_status"], "clear")
-        self.assertEqual(supervisor.get_operational_mode_tool()["mode"], "safety")
+        self.assertEqual(supervisor.get_operational_mode_tool(self.zone_a)["mode"], "safety")
         post_json.assert_called_once_with(
             "/system/safety/clear",
             {"reason": "Area inspected by operator."},
         )
 
-    @patch.object(supervisor, "_post_receiver_json")
+    @patch.object(supervisor, "_post_receiver_json", return_value=True)
     @patch.object(supervisor, "call_pi_set_mode")
-    def test_placeholder_modes_stop_scanners_without_reconfiguring_cameras(
-        self,
-        set_mode,
-        _post,
-    ):
-        self.scanner.running = True
+    def test_investigation_is_a_zone_placeholder_without_camera_changes(self, set_mode, _post):
+        result = supervisor.set_operational_mode("investigation", zones=[self.zone_a])
 
-        for mode in ("investigation",):
-            result = supervisor.set_operational_mode(mode)
-            self.assertEqual(result["status"], "ok")
-            self.assertEqual(result["mode"], mode)
-            self.assertTrue(result["placeholder"])
-            self.assertEqual(result["camera_results"], [])
-
-        self.assertEqual(self.scanner.stop_count, 1)
-        self.assertEqual(self.safety_scanner.stop_count, 1)
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(result["placeholder"])
+        self.assertEqual(result["camera_results"], [])
         set_mode.assert_not_called()
         self.assertNotIn("free", supervisor.PLACEHOLDER_OPERATIONAL_MODES)
         self.assertNotIn("safety", supervisor.PLACEHOLDER_OPERATIONAL_MODES)
 
-    @patch.object(supervisor, "call_pi_set_mode")
-    def test_placeholder_mode_reports_pending_receiver_sync(self, set_mode):
-        self.scanner.running = True
-        with supervisor._operational_lock:
-            supervisor._operational_state.update(
-                mode="search",
-                objective="blue backpack",
-            )
-
-        with patch.object(supervisor, "_post_receiver_json", return_value=False):
-            result = supervisor.set_operational_mode("investigation")
-
-        self.assertEqual(result["status"], "partial_error")
-        self.assertFalse(result["receiver_synced"])
-        self.assertTrue(result["placeholder"])
-        self.assertFalse(result["scanner_running"])
-        self.assertIn("status update is pending", result["message"])
-        set_mode.assert_not_called()
-
     @patch.object(supervisor, "call_pi_set_mode", return_value={"status": "ok"})
-    def test_camera_processing_mode_is_locked_during_visual_scanning(self, set_mode):
-        for operational_mode in ("search", "safety"):
-            with self.subTest(mode=operational_mode):
-                with supervisor._operational_lock:
-                    supervisor._operational_state["mode"] = operational_mode
-
-                blocked = supervisor.execute_supervisor_tool(
-                    "set_camera_mode",
-                    {"camera_id": 0, "mode": "surveillance"},
-                )
-                allowed = supervisor.execute_supervisor_tool(
-                    "set_camera_mode",
-                    {"camera_id": 0, "mode": "default"},
-                )
-
-                self.assertEqual(blocked["status"], "error")
-                self.assertIn(f"{operational_mode.title()} Mode", blocked["error"])
-                self.assertEqual(allowed["status"], "ok")
-        self.assertEqual(set_mode.call_count, 2)
-
-    @patch.object(supervisor, "call_pi_set_mode", return_value={"status": "ok"})
-    def test_free_allows_later_explicit_camera_commands(self, set_mode):
+    def test_camera_processing_lock_only_applies_to_its_own_zone(self, set_mode):
         with supervisor._operational_lock:
-            supervisor._operational_state["mode"] = "free"
+            supervisor._zone_states[self.zone_a]["mode"] = "search"
 
-        result = supervisor.execute_supervisor_tool(
+        blocked = supervisor.execute_supervisor_tool(
             "set_camera_mode",
-            {"camera_id": 0, "mode": "surveillance"},
+            {"camera_id": self.camera_a, "mode": "surveillance"},
+        )
+        allowed = supervisor.execute_supervisor_tool(
+            "set_camera_mode",
+            {"camera_id": self.camera_b, "mode": "surveillance"},
         )
 
-        self.assertEqual(result["status"], "ok")
-        set_mode.assert_called_once_with(0, "surveillance")
+        self.assertEqual(blocked["status"], "error")
+        self.assertEqual(allowed["status"], "ok")
+        set_mode.assert_called_once_with(self.camera_b, "surveillance")
+
+    @patch.object(supervisor, "_post_receiver_json", return_value=True)
+    @patch.object(supervisor, "call_pi_set_mode")
+    def test_all_zones_command_normalizes_every_camera_and_reports_failures(self, set_mode, _post):
+        failed_camera = max(supervisor.CAMERAS)
+        set_mode.side_effect = lambda camera_id, mode: (
+            {"status": "error", "error": "offline"}
+            if camera_id == failed_camera
+            else {"status": "ok"}
+        )
+
+        result = supervisor.set_operational_mode("free")
+
+        self.assertEqual(result["status"], "partial_error")
+        self.assertCountEqual(result["target_zones"], supervisor.ZONE_NAMES)
+        self.assertEqual(len(result["camera_results"]), len(supervisor.CAMERAS))
+        self.assertIn(str(failed_camera), result["message"])
 
     def test_text_and_voice_share_the_new_operational_tool_schema(self):
         tool_names = {tool["name"] for tool in supervisor.tools}
@@ -469,9 +333,16 @@ class OperationalModeTests(unittest.TestCase):
             operational_tool["parameters"]["properties"]["mode"]["enum"],
             ["free", "safety", "search", "investigation"],
         )
+        self.assertEqual(
+            operational_tool["parameters"]["properties"]["zones"]["items"]["enum"],
+            list(supervisor.ZONE_NAMES),
+        )
+        report_tool = next(tool for tool in supervisor.tools if tool["name"] == "generate_daily_report")
+        self.assertIn("zones", report_tool["parameters"]["required"])
+        self.assertIn("separate PDF", report_tool["description"])
         self.assertIn("not an operational mode", supervisor.SYSTEM_PROMPT)
-        self.assertIn("starts\n  in Free Mode", supervisor.SYSTEM_PROMPT)
-        self.assertIn("switch to Free Mode", supervisor.SYSTEM_PROMPT)
+        self.assertIn("different zones can run different modes", supervisor.SYSTEM_PROMPT)
+        self.assertIn("Never\n  change an unmentioned zone", supervisor.SYSTEM_PROMPT)
         self.assertIn("Fire Hazard", supervisor.SYSTEM_PROMPT)
         self.assertIn("Work-Zone Intrusion", supervisor.SYSTEM_PROMPT)
         self.assertIn("Unauthorized Entry", supervisor.SYSTEM_PROMPT)
@@ -497,91 +368,6 @@ class OperationalModeTests(unittest.TestCase):
         finally:
             supervisor._startup_mode_initialized = original_initialized
 
-    @patch.object(supervisor, "_post_receiver_json")
-    def test_overlapping_search_then_free_finishes_consistently(self, _post):
-        camera_call_started = threading.Event()
-        release_camera_calls = threading.Event()
-        free_attempted = threading.Event()
-        free_done = threading.Event()
-
-        def blocked_set_mode(camera_id, mode):
-            camera_call_started.set()
-            release_camera_calls.wait(timeout=2)
-            return {"status": "ok", "camera_id": camera_id, "mode": mode}
-
-        with patch.object(supervisor, "call_pi_set_mode", side_effect=blocked_set_mode):
-            search_thread = threading.Thread(
-                target=supervisor.set_operational_mode,
-                args=("search", "red fire extinguisher"),
-            )
-
-            def select_free():
-                free_attempted.set()
-                supervisor.set_operational_mode("free")
-                free_done.set()
-
-            free_thread = threading.Thread(target=select_free)
-            search_thread.start()
-            self.assertTrue(camera_call_started.wait(timeout=1))
-            free_thread.start()
-            self.assertTrue(free_attempted.wait(timeout=1))
-            self.assertFalse(free_done.wait(timeout=0.05))
-            release_camera_calls.set()
-            search_thread.join(timeout=2)
-            free_thread.join(timeout=2)
-            self.assertFalse(search_thread.is_alive())
-            self.assertFalse(free_thread.is_alive())
-
-        state = supervisor.get_operational_mode_tool()
-        self.assertEqual(state["mode"], "free")
-        self.assertFalse(state["scanner_running"])
-        self.assertFalse(state["placeholder"])
-
-    @patch.object(supervisor, "_post_receiver_json")
-    def test_camera_command_cannot_finish_after_search_configuration(self, _post):
-        camera_call_started = threading.Event()
-        release_camera_call = threading.Event()
-        search_attempted = threading.Event()
-        search_done = threading.Event()
-        completions = []
-        completions_lock = threading.Lock()
-
-        def ordered_set_mode(camera_id, mode):
-            if mode == "surveillance":
-                camera_call_started.set()
-                release_camera_call.wait(timeout=2)
-            with completions_lock:
-                completions.append((camera_id, mode))
-            return {"status": "ok", "camera_id": camera_id, "mode": mode}
-
-        with patch.object(supervisor, "call_pi_set_mode", side_effect=ordered_set_mode):
-            camera_thread = threading.Thread(
-                target=supervisor.execute_supervisor_tool,
-                args=("set_camera_mode", {"camera_id": 0, "mode": "surveillance"}),
-            )
-
-            def select_search():
-                search_attempted.set()
-                supervisor.set_operational_mode("search", "red fire extinguisher")
-                search_done.set()
-
-            search_thread = threading.Thread(target=select_search)
-            camera_thread.start()
-            self.assertTrue(camera_call_started.wait(timeout=1))
-            search_thread.start()
-            self.assertTrue(search_attempted.wait(timeout=1))
-            self.assertFalse(search_done.wait(timeout=0.05))
-            release_camera_call.set()
-            camera_thread.join(timeout=2)
-            search_thread.join(timeout=2)
-            self.assertFalse(camera_thread.is_alive())
-            self.assertFalse(search_thread.is_alive())
-
-        self.assertEqual(completions[0], (0, "surveillance"))
-        self.assertTrue(all(mode == "default" for _, mode in completions[1:]))
-        self.assertEqual(supervisor.get_operational_mode_tool()["mode"], "search")
-
-
 class SearchScannerTests(unittest.TestCase):
     def setUp(self):
         self.client = FakeClient()
@@ -602,6 +388,33 @@ class SearchScannerTests(unittest.TestCase):
         self.assertIn("red fire extinguisher", prompt)
         self.assertIn("person, object, vehicle", prompt)
         self.assertNotIn("emergency intent", prompt.lower())
+
+    def test_zone_scanner_ignores_active_cameras_from_other_zones(self):
+        scoped_scanner = SearchScanner(
+            client=self.client,
+            receiver_url="http://receiver.test",
+            model="vision-test",
+            camera_ids=[1, 3],
+            scope_label="Shared Zone",
+        )
+        response = type(
+            "CameraResponse",
+            (),
+            {
+                "raise_for_status": lambda self: None,
+                "json": lambda self: {
+                    "cameras": [
+                        {"camera_id": camera_id, "stream_active": True}
+                        for camera_id in range(4)
+                    ]
+                },
+            },
+        )()
+
+        with patch("search_vlm.requests.get", return_value=response):
+            active = scoped_scanner._active_camera_ids(threading.Event())
+
+        self.assertEqual(active, [1, 3])
 
     def test_match_posts_a_noncritical_search_alert(self):
         self.scanner._target = "red fire extinguisher"
@@ -957,6 +770,19 @@ class ReceiverOperationalStateTests(unittest.TestCase):
                 objective=None,
                 scanner_running=False,
                 placeholder=False,
+                zones=[
+                    {
+                        "zone": zone,
+                        "camera_ids": list(camera_ids),
+                        "mode": "free",
+                        "objective": None,
+                        "scanner_running": False,
+                        "placeholder": False,
+                    }
+                    for zone, camera_ids in sorted(
+                        stream_receiver_server.ZONE_CAMERAS.items()
+                    )
+                ],
                 updated_at=None,
                 safety_status="clear",
                 active_safety_hazards=[],
@@ -994,6 +820,56 @@ class ReceiverOperationalStateTests(unittest.TestCase):
                 mode == "investigation",
             )
 
+    def test_receiver_merges_independent_zone_updates_and_reports_mixed(self):
+        zone_a, zone_b = list(stream_receiver_server.ZONE_CAMERAS)[:2]
+        response = self.client.post(
+            "/system/state",
+            json={
+                "zones": [
+                    {
+                        "zone": zone_a,
+                        "mode": "search",
+                        "objective": "blue backpack",
+                        "scanner_running": True,
+                    },
+                    {
+                        "zone": zone_b,
+                        "mode": "safety",
+                        "scanner_running": True,
+                    },
+                ]
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        state = self.client.get("/system/state").json()
+        self.assertEqual(state["mode"], "mixed")
+        by_zone = {item["zone"]: item for item in state["zones"]}
+        self.assertEqual(by_zone[zone_a]["objective"], "blue backpack")
+        self.assertEqual(by_zone[zone_b]["mode"], "safety")
+        untouched = set(stream_receiver_server.ZONE_CAMERAS) - {zone_a, zone_b}
+        self.assertTrue(all(by_zone[zone]["mode"] == "free" for zone in untouched))
+
+    def test_receiver_rejects_unknown_zone_without_partial_update(self):
+        response = self.client.post(
+            "/system/state",
+            json={"zones": [{"zone": "Moon Base", "mode": "search", "objective": "bag"}]},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.client.get("/system/state").json()["mode"], "free")
+
+    def test_receiver_rejects_zone_search_without_an_objective(self):
+        zone = next(iter(stream_receiver_server.ZONE_CAMERAS))
+        response = self.client.post(
+            "/system/state",
+            json={"zones": [{"zone": zone, "mode": "search", "scanner_running": True}]},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("requires an objective", response.json()["error"])
+        self.assertEqual(self.client.get("/system/state").json()["mode"], "free")
+
     def test_safety_hazard_latches_until_explicit_operator_clear(self):
         hazard_response = self.client.post(
             "/system/safety/hazard",
@@ -1013,6 +889,10 @@ class ReceiverOperationalStateTests(unittest.TestCase):
         self.assertEqual(
             state["active_safety_hazards"][0]["hazard_name"],
             "Fire Hazard",
+        )
+        self.assertEqual(
+            state["active_safety_hazards"][0]["zone"],
+            stream_receiver_server.CAMERA_REGISTRY[2]["zone"],
         )
         alert = self.client.get("/system/log").json()[-1]
         self.assertEqual(alert["kind"], "safety_alert")
@@ -1059,6 +939,9 @@ class ReceiverOperationalStateTests(unittest.TestCase):
             self.assertIn(label.lower(), html.lower())
         self.assertNotIn("'reporting'", html.lower())
         self.assertIn("Operational mode", html)
+        self.assertIn("Zone operational states", html)
+        self.assertIn("Independent zone operation", html)
+        self.assertIn("'mixed'", html)
         self.assertIn("Mode objective", html)
         self.assertIn("No workflow", html)
         self.assertIn("Construction safety", html)

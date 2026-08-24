@@ -53,6 +53,7 @@ _system_state = {
     "objective": None,
     "scanner_running": False,
     "placeholder": False,
+    "zones": [],
     "updated_at": None,
     "safety_status": "clear",
     "active_safety_hazards": [],
@@ -84,9 +85,27 @@ def _load_registry() -> dict:
         registry[cid] = {
             "name": cam.get("name", f"Camera {cid}"),
             "location": cam.get("location", ""),
+            "zone": str(cam.get("zone") or "Unassigned").strip() or "Unassigned",
             "pi_host": cam.get("pi_host"),
         }
     return registry
+
+
+CAMERA_REGISTRY = _load_registry()
+ZONE_CAMERAS: dict[str, list[int]] = {}
+for _camera_id, _camera in sorted(CAMERA_REGISTRY.items()):
+    ZONE_CAMERAS.setdefault(_camera["zone"], []).append(_camera_id)
+_system_state["zones"] = [
+    {
+        "zone": zone,
+        "camera_ids": list(camera_ids),
+        "mode": "free",
+        "objective": None,
+        "scanner_running": False,
+        "placeholder": False,
+    }
+    for zone, camera_ids in sorted(ZONE_CAMERAS.items())
+]
 
 
 def _get_args():
@@ -130,6 +149,9 @@ def _log_system_event(payload: dict) -> dict:
     if camera_id is not None:
         try:
             entry["camera_id"] = int(camera_id)
+            camera = CAMERA_REGISTRY.get(entry["camera_id"])
+            if camera is not None:
+                entry["zone"] = camera["zone"]
         except (TypeError, ValueError):
             pass
 
@@ -246,6 +268,7 @@ async def list_cameras():
             "camera_id": cid,
             "name": info.get("name", f"Camera {cid}"),
             "location": info.get("location", ""),
+            "zone": info.get("zone", "Unassigned"),
             "pi_host": info.get("pi_host"),
             "registered": cid in camera_registry,
             "last_seen": last_seen,
@@ -291,6 +314,7 @@ async def latest_frame(camera_id: int):
 
 def _system_state_copy_locked() -> dict:
     state = dict(_system_state)
+    state["zones"] = [dict(zone_state) for zone_state in _system_state.get("zones") or []]
     state["active_safety_hazards"] = [
         dict(hazard) for hazard in _system_state.get("active_safety_hazards") or []
     ]
@@ -311,29 +335,116 @@ async def update_system_state(request: Request):
     except Exception:
         return JSONResponse({"status": "error", "error": "Request body must be JSON."}, status_code=400)
 
-    mode = str(payload.get("mode") or "free").strip().lower()
-    if mode not in OPERATIONAL_MODES:
+    raw_zone_states = payload.get("zones")
+    if raw_zone_states is not None and not isinstance(raw_zone_states, list):
         return JSONResponse(
-            {
-                "status": "error",
-                "error": f"Unknown operational mode: {mode}",
-            },
+            {"status": "error", "error": "zones must be an array."},
             status_code=400,
         )
 
-    objective = payload.get("objective")
-    if objective is not None:
-        objective = str(objective).strip() or None
-    if mode in {"free", "safety"}:
-        objective = None
+    zone_lookup = {zone.casefold(): zone for zone in ZONE_CAMERAS}
+    normalized_updates: dict[str, dict] = {}
+    if raw_zone_states is not None:
+        for raw_state in raw_zone_states:
+            if not isinstance(raw_state, dict):
+                return JSONResponse(
+                    {"status": "error", "error": "Every zone state must be an object."},
+                    status_code=400,
+                )
+            raw_zone = str(raw_state.get("zone") or "").strip()
+            zone = zone_lookup.get(raw_zone.casefold())
+            if zone is None:
+                return JSONResponse(
+                    {"status": "error", "error": f"Unknown zone: {raw_zone}"},
+                    status_code=400,
+                )
+            if zone in normalized_updates:
+                return JSONResponse(
+                    {"status": "error", "error": f"Duplicate zone state: {zone}"},
+                    status_code=400,
+                )
+            mode = str(raw_state.get("mode") or "free").strip().lower()
+            if mode not in OPERATIONAL_MODES:
+                return JSONResponse(
+                    {"status": "error", "error": f"Unknown operational mode: {mode}"},
+                    status_code=400,
+                )
+            objective = raw_state.get("objective")
+            if objective is not None:
+                objective = str(objective).strip() or None
+            if mode in {"free", "safety"}:
+                objective = None
+            if mode == "search" and objective is None:
+                return JSONResponse(
+                    {"status": "error", "error": f"Search Mode requires an objective for {zone}."},
+                    status_code=400,
+                )
+            normalized_updates[zone] = {
+                "zone": zone,
+                "camera_ids": list(ZONE_CAMERAS[zone]),
+                "mode": mode,
+                "objective": objective,
+                "scanner_running": (
+                    bool(raw_state.get("scanner_running"))
+                    if mode in {"search", "safety"}
+                    else False
+                ),
+                "placeholder": mode in PLACEHOLDER_OPERATIONAL_MODES,
+            }
+    else:
+        # Backward-compatible whole-site update: apply the requested mode to every zone.
+        mode = str(payload.get("mode") or "free").strip().lower()
+        if mode not in OPERATIONAL_MODES:
+            return JSONResponse(
+                {"status": "error", "error": f"Unknown operational mode: {mode}"},
+                status_code=400,
+            )
+        objective = payload.get("objective")
+        if objective is not None:
+            objective = str(objective).strip() or None
+        if mode in {"free", "safety"}:
+            objective = None
+        if mode == "search" and objective is None:
+            return JSONResponse(
+                {"status": "error", "error": "Search Mode requires an objective."},
+                status_code=400,
+            )
+        normalized_updates = {
+            zone: {
+                "zone": zone,
+                "camera_ids": list(camera_ids),
+                "mode": mode,
+                "objective": objective,
+                "scanner_running": (
+                    bool(payload.get("scanner_running"))
+                    if mode in {"search", "safety"}
+                    else False
+                ),
+                "placeholder": mode in PLACEHOLDER_OPERATIONAL_MODES,
+            }
+            for zone, camera_ids in ZONE_CAMERAS.items()
+        }
 
     with _lock:
-        _system_state["mode"] = mode
-        _system_state["objective"] = objective
-        _system_state["scanner_running"] = (
-            bool(payload.get("scanner_running")) if mode in {"search", "safety"} else False
+        existing = {
+            state["zone"]: dict(state)
+            for state in _system_state.get("zones") or []
+        }
+        existing.update(normalized_updates)
+        zone_states = [existing[zone] for zone in sorted(existing)]
+        modes = {state["mode"] for state in zone_states}
+        objectives = {state["objective"] for state in zone_states}
+        _system_state["mode"] = next(iter(modes)) if len(modes) == 1 else "mixed"
+        _system_state["objective"] = (
+            next(iter(objectives)) if len(modes) == 1 and len(objectives) == 1 else None
         )
-        _system_state["placeholder"] = mode in PLACEHOLDER_OPERATIONAL_MODES
+        _system_state["scanner_running"] = any(
+            state["scanner_running"] for state in zone_states
+        )
+        _system_state["placeholder"] = bool(zone_states) and all(
+            state["placeholder"] for state in zone_states
+        )
+        _system_state["zones"] = zone_states
         _system_state["updated_at"] = time.time()
         state = _system_state_copy_locked()
     return JSONResponse({"status": "ok", "state": state})
@@ -362,7 +473,8 @@ async def latch_safety_hazard(request: Request):
         )
 
     cause = str(payload.get("cause") or "").strip() or "Visible evidence triggered this safety check."
-    message = f"STOP WORK — {hazard_name} on camera {camera_id}: {cause}"
+    zone = CAMERA_REGISTRY.get(camera_id, {}).get("zone", "Unassigned")
+    message = f"STOP WORK — {hazard_name} in {zone} on camera {camera_id}: {cause}"
     now = time.time()
     event_payload = {
         "kind": "safety_alert",
@@ -372,6 +484,7 @@ async def latch_safety_hazard(request: Request):
         "hazard_name": hazard_name,
         "cause": cause,
         "camera_id": camera_id,
+        "zone": zone,
         "confidence": payload.get("confidence"),
         "frame_jpeg_b64": payload.get("frame_jpeg_b64"),
     }
@@ -383,6 +496,7 @@ async def latch_safety_hazard(request: Request):
             "hazard_name": hazard_name,
             "cause": cause,
             "camera_id": camera_id,
+            "zone": zone,
             "confidence": event.get("confidence"),
             "detected_at": now,
             "event_id": event["id"],
@@ -1221,6 +1335,47 @@ INDEX_HTML = r"""<!DOCTYPE html>
       font-weight: 500;
       line-height: 1.4;
     }
+    .zone-state-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+    }
+    .zone-state-card {
+      padding: 14px 16px;
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      background: rgba(255,255,255,0.04);
+    }
+    .zone-state-card.search { border-color: rgba(56, 189, 248, 0.48); }
+    .zone-state-card.safety { border-color: rgba(52, 211, 153, 0.42); }
+    .zone-state-card.hazard {
+      border-color: rgba(239, 68, 68, 0.76);
+      background: linear-gradient(135deg, rgba(127, 29, 29, 0.4), rgba(69, 10, 10, 0.2));
+    }
+    .zone-state-heading {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .zone-state-name { font-size: 0.9375rem; font-weight: 750; }
+    .zone-state-cameras { color: var(--text-muted); font-size: 0.6875rem; }
+    .zone-state-mode {
+      margin-top: 8px;
+      color: #7dd3fc;
+      font-size: 0.8125rem;
+      font-weight: 700;
+    }
+    .zone-state-card.free .zone-state-mode { color: #67e8a5; }
+    .zone-state-card.investigation .zone-state-mode { color: #c4b5fd; }
+    .zone-state-card.hazard .zone-state-mode { color: #fecaca; }
+    .zone-state-detail {
+      margin-top: 5px;
+      min-height: 2.7em;
+      color: var(--text-muted);
+      font-size: 0.75rem;
+      line-height: 1.35;
+    }
     .system-log {
       width: 100%;
       border: 1px solid var(--card-border);
@@ -1457,6 +1612,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
           <div class="safety-detail" id="system-safety-detail">No active safety hazards.</div>
         </div>
       </div>
+      <div class="zone-state-grid" id="zone-state-grid" aria-label="Zone operational states"></div>
       <div class="system-log">
         <div class="system-log-header">
           <div class="system-log-title">System log</div>
@@ -1499,6 +1655,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       const systemOverview = document.getElementById('system-overview');
       const systemSafetyValue = document.getElementById('system-safety-value');
       const systemSafetyDetail = document.getElementById('system-safety-detail');
+      const zoneStateGrid = document.getElementById('zone-state-grid');
       const systemLogList = document.getElementById('system-log-list');
       let systemLogInitialized = false;
       let lastAlertEventId = 0;
@@ -1594,6 +1751,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         btnName.textContent = cam.name || ('Camera ' + cam.camera_id);
         btnMeta.textContent = '#' + cam.camera_id;
         const parts = [];
+        if (cam.zone) parts.push(cam.zone);
         if (cam.location) parts.push(cam.location);
         if (cam.pi_host) parts.push('Pi ' + cam.pi_host);
         subtitle.textContent = parts.length ? parts.join(' · ') : ('Camera ' + cam.camera_id);
@@ -1617,6 +1775,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
           const live = cam.stream_active;
           const selected = feedMode === 'single' && cam.camera_id === selectedId;
           const line2Parts = [];
+          if (cam.zone) line2Parts.push(cam.zone);
           if (cam.location) line2Parts.push(cam.location);
           if (cam.pi_host) line2Parts.push('Pi ' + cam.pi_host);
           if (!cam.registered) line2Parts.push('unregistered');
@@ -1785,6 +1944,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       function updateGridTile(tile, cam) {
         const name = cam.name || ('Camera ' + cam.camera_id);
         const meta = [];
+        if (cam.zone) meta.push(cam.zone);
         if (cam.location) meta.push(cam.location);
         if (cam.pi_host) meta.push('Pi ' + cam.pi_host);
         if (!cam.registered) meta.push('unregistered');
@@ -2053,12 +2213,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
         fetch('/system/state')
           .then(r => r.json())
           .then(state => {
-            const knownModes = ['free', 'safety', 'search', 'investigation'];
+            const knownModes = ['free', 'safety', 'search', 'investigation', 'mixed'];
             const mode = knownModes.includes(state.mode) ? state.mode : 'free';
             systemModeValue.textContent = mode.charAt(0).toUpperCase() + mode.slice(1);
-            systemModeValue.className = 'value' + (mode === 'search' ? ' search' : '');
-            systemObjectiveValue.textContent = state.objective || 'None';
-            systemStatusValue.textContent = (mode === 'search' || mode === 'safety')
+            systemModeValue.className = 'value' + (mode === 'search' || mode === 'mixed' ? ' search' : '');
+            systemObjectiveValue.textContent = mode === 'mixed' ? 'See zones below' : (state.objective || 'None');
+            systemStatusValue.textContent = mode === 'mixed'
+              ? 'Independent zone operation'
+              : (mode === 'search' || mode === 'safety')
               ? (state.scanner_running ? 'Scanning' : 'Scanner stopped')
               : (mode === 'free' ? 'No workflow' : 'Placeholder');
 
@@ -2077,6 +2239,33 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 ? 'Operator clearance required.'
                 : 'No active safety hazards.';
             }
+
+            const zoneStates = Array.isArray(state.zones) ? state.zones : [];
+            const hazardZones = new Set(activeHazards.map(item => item.zone).filter(Boolean));
+            zoneStateGrid.innerHTML = zoneStates.map(zoneState => {
+              const zoneMode = ['free', 'safety', 'search', 'investigation'].includes(zoneState.mode)
+                ? zoneState.mode
+                : 'free';
+              const isHazard = hazardZones.has(zoneState.zone);
+              const cameraIds = Array.isArray(zoneState.camera_ids) ? zoneState.camera_ids : [];
+              const detail = isHazard
+                ? 'STOP WORK — Operator clearance required.'
+                : (zoneMode === 'search'
+                    ? (zoneState.objective || 'Search objective not set')
+                    : (zoneMode === 'safety'
+                        ? (zoneState.scanner_running ? 'Monitoring active safety hazards' : 'Safety scanner stopped')
+                        : (zoneMode === 'free' ? 'Live view with no automated workflow' : 'Placeholder mode')));
+              return (
+                '<div class="zone-state-card ' + escapeHtml(zoneMode) + (isHazard ? ' hazard' : '') + '">' +
+                  '<div class="zone-state-heading">' +
+                    '<span class="zone-state-name">' + escapeHtml(zoneState.zone || 'Zone') + '</span>' +
+                    '<span class="zone-state-cameras">Cameras ' + escapeHtml(cameraIds.join(', ') || 'none') + '</span>' +
+                  '</div>' +
+                  '<div class="zone-state-mode">' + escapeHtml(zoneMode.charAt(0).toUpperCase() + zoneMode.slice(1)) + ' Mode</div>' +
+                  '<div class="zone-state-detail">' + escapeHtml(detail) + '</div>' +
+                '</div>'
+              );
+            }).join('');
           })
           .catch(() => {});
       }

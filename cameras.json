@@ -4,6 +4,7 @@
       "id": 0,
       "name": "Camera 0",
       "location": "Front Gate",
+      "zone": "Zone 0",
       "pi_host": "128.189.192.173",
       "pi_port": 8000
     },
@@ -11,20 +12,23 @@
       "id": 1,
       "name": "Camera 1",
       "location": "Warehouse",
-      "pi_host": "172.20.10.4",
+      "zone": "Zone 1",
+      "pi_host": "172.20.10.6",
       "pi_port": 8000
     },
     {
       "id": 2,
       "name": "Camera 2",
       "location": "Pump Station",
-      "pi_host": "172.20.10.3",
+      "zone": "Zone 2",
+      "pi_host": "172.20.10.5",
       "pi_port": 8000
     },
     {
       "id": 3,
       "name": "Camera 3",
       "location": "Bunbury Yard",
+      "zone": "Zone 3",
       "pi_host": "206.87.96.84",
       "pi_port": 8000
     }

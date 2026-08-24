@@ -7,7 +7,7 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import Any, Iterable
 
 import requests
 
@@ -26,6 +26,8 @@ class SearchScanner:
         match_threshold: float = 0.75,
         alert_cooldown_sec: float = 10.0,
         max_workers: int = 4,
+        camera_ids: Iterable[int] | None = None,
+        scope_label: str | None = None,
     ) -> None:
         self.client = client
         self.receiver_url = receiver_url.rstrip("/")
@@ -35,6 +37,12 @@ class SearchScanner:
         self.match_threshold = match_threshold
         self.alert_cooldown_sec = alert_cooldown_sec
         self.max_workers = max_workers
+        self.camera_ids = (
+            frozenset(int(camera_id) for camera_id in camera_ids)
+            if camera_ids is not None
+            else None
+        )
+        self.scope_label = str(scope_label or "").strip()
 
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -106,7 +114,11 @@ class SearchScanner:
                 self._post_log(
                     kind="scan",
                     level="info",
-                    message=f"Search VLM scanner started using {self.model}.",
+                    message=(
+                        f"Search VLM scanner started for {self.scope_label} using {self.model}."
+                        if self.scope_label
+                        else f"Search VLM scanner started using {self.model}."
+                    ),
                 )
             while not stop_event.is_set():
                 cycle_started = time.time()
@@ -157,7 +169,11 @@ class SearchScanner:
                 self._post_log(
                     kind="scan",
                     level="info",
-                    message="Search VLM scanner stopped.",
+                    message=(
+                        f"Search VLM scanner stopped for {self.scope_label}."
+                        if self.scope_label
+                        else "Search VLM scanner stopped."
+                    ),
                 )
 
     def _discard_inflight(self, search_key: tuple[int, int]) -> None:
@@ -194,9 +210,11 @@ class SearchScanner:
                 continue
             if camera.get("stream_active"):
                 try:
-                    active.append(int(camera["camera_id"]))
+                    camera_id = int(camera["camera_id"])
                 except (KeyError, TypeError, ValueError):
                     continue
+                if self.camera_ids is None or camera_id in self.camera_ids:
+                    active.append(camera_id)
         return sorted(active)
 
     def _log_active_set_change(
@@ -212,9 +230,11 @@ class SearchScanner:
                 return True
             self._last_active_set = current
             if current:
-                message = "Scanning active camera streams: " + ", ".join(str(cid) for cid in current) + "."
+                prefix = f"Scanning active camera streams for {self.scope_label}: " if self.scope_label else "Scanning active camera streams: "
+                message = prefix + ", ".join(str(cid) for cid in current) + "."
             else:
-                message = "No active camera streams are currently available for Search Mode scanning."
+                scope = f" in {self.scope_label}" if self.scope_label else ""
+                message = f"No active camera streams are currently available for Search Mode scanning{scope}."
             self._post_log(kind="scan", level="info", message=message)
             return True
 
@@ -247,10 +267,11 @@ class SearchScanner:
                 # Keep mode/target invalidation serialized with alert publication.
                 # This ensures a mode switch cannot be published before an old
                 # in-flight result has either been discarded or fully logged.
+                scope = f" in {self.scope_label}" if self.scope_label else ""
                 self._post_log(
                     kind="alert",
                     level="info",
-                    message=f'SEARCH MATCH for "{target}" on camera {camera_id}: {summary}',
+                    message=f'SEARCH MATCH for "{target}" on camera {camera_id}{scope}: {summary}',
                     camera_id=camera_id,
                     confidence=confidence,
                     frame_bytes=frame_bytes,
@@ -266,7 +287,11 @@ class SearchScanner:
                     self._post_log(
                         kind="scan",
                         level="warning",
-                        message=f"Search scan failed for camera {camera_id}: {exc}",
+                        message=(
+                            f"Search scan failed for camera {camera_id}"
+                            + (f" in {self.scope_label}" if self.scope_label else "")
+                            + f": {exc}"
+                        ),
                         camera_id=camera_id,
                     )
 

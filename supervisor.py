@@ -77,7 +77,7 @@ MAX_TOOL_ROUNDS = 6
 
 
 def load_cameras() -> dict:
-    """Load camera registry. Returns {camera_id: {name, location, pi_host, pi_port}}."""
+    """Load camera registry, including each camera's operator-facing zone."""
     try:
         with open(CAMERAS_FILE, "r") as f:
             data = json.load(f)
@@ -92,6 +92,7 @@ def load_cameras() -> dict:
         registry[cid] = {
             "name": cam.get("name", f"Camera {cid}"),
             "location": cam.get("location", ""),
+            "zone": str(cam.get("zone") or "Unassigned").strip() or "Unassigned",
             "pi_host": cam.get("pi_host"),
             "pi_port": int(cam.get("pi_port", 8000)),
         }
@@ -99,6 +100,11 @@ def load_cameras() -> dict:
 
 
 CAMERAS = load_cameras()
+ZONES: dict[str, list[int]] = {}
+for _camera_id, _camera in sorted(CAMERAS.items()):
+    ZONES.setdefault(_camera["zone"], []).append(_camera_id)
+ZONE_NAMES = tuple(sorted(ZONES))
+_ZONE_LOOKUP = {zone.casefold(): zone for zone in ZONE_NAMES}
 OPERATIONAL_MODES = {"free", "safety", "search", "investigation"}
 PLACEHOLDER_OPERATIONAL_MODES = {"investigation"}
 _orchestration_lock = threading.RLock()
@@ -107,29 +113,39 @@ _state_publisher_lock = threading.Lock()
 _state_publisher_started = False
 _startup_mode_lock = threading.Lock()
 _startup_mode_initialized = False
-_operational_state = {
-    "mode": "free",
-    "objective": None,
+_zone_states = {
+    zone: {"mode": "free", "objective": None}
+    for zone in ZONE_NAMES
 }
-search_scanner = SearchScanner(
-    client=client,
-    receiver_url=STREAM_RECEIVER_URL,
-    model=SEARCH_VLM_MODEL,
-    image_detail=SEARCH_VLM_DETAIL,
-    match_threshold=SEARCH_MATCH_THRESHOLD,
-    max_workers=max(4, len(CAMERAS) or 1),
-)
-safety_scanner = SafetyScanner(
-    client=client,
-    receiver_url=STREAM_RECEIVER_URL,
-    model=SAFETY_VLM_MODEL,
-    image_detail=SAFETY_VLM_DETAIL,
-    match_threshold=SAFETY_MATCH_THRESHOLD,
-    max_workers=max(4, len(CAMERAS) or 1),
-    site_timezone=SAFETY_SITE_TIMEZONE,
-    access_start_hour=SAFETY_ACCESS_START_HOUR,
-    access_end_hour=SAFETY_ACCESS_END_HOUR,
-)
+search_scanners = {
+    zone: SearchScanner(
+        client=client,
+        receiver_url=STREAM_RECEIVER_URL,
+        model=SEARCH_VLM_MODEL,
+        image_detail=SEARCH_VLM_DETAIL,
+        match_threshold=SEARCH_MATCH_THRESHOLD,
+        max_workers=max(1, min(4, len(camera_ids))),
+        camera_ids=camera_ids,
+        scope_label=zone,
+    )
+    for zone, camera_ids in ZONES.items()
+}
+safety_scanners = {
+    zone: SafetyScanner(
+        client=client,
+        receiver_url=STREAM_RECEIVER_URL,
+        model=SAFETY_VLM_MODEL,
+        image_detail=SAFETY_VLM_DETAIL,
+        match_threshold=SAFETY_MATCH_THRESHOLD,
+        max_workers=max(1, min(4, len(camera_ids))),
+        site_timezone=SAFETY_SITE_TIMEZONE,
+        access_start_hour=SAFETY_ACCESS_START_HOUR,
+        access_end_hour=SAFETY_ACCESS_END_HOUR,
+        camera_ids=camera_ids,
+        scope_label=zone,
+    )
+    for zone, camera_ids in ZONES.items()
+}
 
 
 def _pi_base_url(camera_id: int) -> Optional[str]:
@@ -186,9 +202,14 @@ def list_cameras_tool() -> dict:
                 "camera_id": cid,
                 "name": info["name"],
                 "location": info.get("location", ""),
+                "zone": info["zone"],
                 "pi_host": info.get("pi_host"),
             }
             for cid, info in sorted(CAMERAS.items())
+        ],
+        "zones": [
+            {"zone": zone, "camera_ids": list(camera_ids)}
+            for zone, camera_ids in sorted(ZONES.items())
         ],
     }
 
@@ -202,24 +223,57 @@ def _post_receiver_json(path: str, payload: dict) -> bool:
         return False
 
 
-def _scanner_running_for_mode(mode: str) -> bool:
+def _scanner_running_for_zone(zone: str, mode: str) -> bool:
     if mode == "search":
-        return search_scanner.is_running()
+        return search_scanners[zone].is_running()
     if mode == "safety":
-        return safety_scanner.is_running()
+        return safety_scanners[zone].is_running()
     return False
+
+
+def _zone_state_payload_locked() -> list[dict[str, Any]]:
+    return [
+        {
+            "zone": zone,
+            "camera_ids": list(ZONES[zone]),
+            "mode": state["mode"],
+            "objective": state["objective"],
+            "scanner_running": _scanner_running_for_zone(zone, state["mode"]),
+            "placeholder": state["mode"] in PLACEHOLDER_OPERATIONAL_MODES,
+        }
+        for zone, state in sorted(_zone_states.items())
+    ]
+
+
+def _summarize_zone_payload(zone_states: list[dict[str, Any]]) -> dict[str, Any]:
+    if not zone_states:
+        return {
+            "mode": "free",
+            "objective": None,
+            "scanner_running": False,
+            "placeholder": False,
+        }
+    modes = {state["mode"] for state in zone_states}
+    objectives = {state["objective"] for state in zone_states}
+    if len(modes) == 1:
+        mode = next(iter(modes))
+        objective = next(iter(objectives)) if len(objectives) == 1 else None
+    else:
+        mode = "mixed"
+        objective = None
+    return {
+        "mode": mode,
+        "objective": objective,
+        "scanner_running": any(state["scanner_running"] for state in zone_states),
+        "placeholder": bool(zone_states) and all(state["placeholder"] for state in zone_states),
+    }
 
 
 def _publish_operational_state() -> bool:
     with _orchestration_lock:
         with _operational_lock:
-            mode = _operational_state["mode"]
-            payload = {
-                "mode": mode,
-                "objective": _operational_state["objective"],
-                "scanner_running": _scanner_running_for_mode(mode),
-                "placeholder": mode in PLACEHOLDER_OPERATIONAL_MODES,
-            }
+            zone_states = _zone_state_payload_locked()
+            payload = {**_summarize_zone_payload(zone_states), "zones": zone_states}
         return _post_receiver_json("/system/state", payload)
 
 
@@ -231,15 +285,21 @@ def _reconcile_operational_state() -> bool:
             return False
 
         with _operational_lock:
-            mode = _operational_state["mode"]
-            objective = _operational_state["objective"]
-        if mode == "search" and objective and not search_scanner.is_running():
-            search_scanner.start(objective)
-            return _publish_operational_state()
-        if mode == "safety" and not safety_scanner.is_running():
-            safety_scanner.start()
-            return _publish_operational_state()
-        return True
+            desired_states = {
+                zone: dict(state)
+                for zone, state in _zone_states.items()
+            }
+        scanner_started = False
+        for zone, state in desired_states.items():
+            mode = state["mode"]
+            objective = state["objective"]
+            if mode == "search" and objective and not search_scanners[zone].is_running():
+                search_scanners[zone].start(objective)
+                scanner_started = True
+            elif mode == "safety" and not safety_scanners[zone].is_running():
+                safety_scanners[zone].start()
+                scanner_started = True
+        return _publish_operational_state() if scanner_started else True
 
 
 def _operational_state_publisher_loop() -> None:
@@ -304,25 +364,69 @@ def start_reporting_recorder() -> None:
     reporting_service.start()
 
 
-def _set_all_cameras_default() -> list[dict]:
-    camera_ids = sorted(CAMERAS.keys())
+def _coerce_zone_names(raw_zones: Any = None) -> list[str]:
+    if raw_zones is None:
+        return list(ZONE_NAMES)
+    if isinstance(raw_zones, str):
+        clean = raw_zones.strip()
+        if clean.casefold() in {"all", "*", "every", "all zones"}:
+            return list(ZONE_NAMES)
+        raw_values = [part.strip() for part in clean.split(",") if part.strip()]
+    elif isinstance(raw_zones, (list, tuple, set)):
+        raw_values = list(raw_zones)
+    else:
+        raw_values = [raw_zones]
+    if not raw_values:
+        raise ValueError("At least one zone is required.")
+
+    resolved: list[str] = []
+    unknown: list[str] = []
+    for value in raw_values:
+        clean = str(value or "").strip()
+        zone = _ZONE_LOOKUP.get(clean.casefold())
+        if zone is None:
+            unknown.append(clean or "<empty>")
+        elif zone not in resolved:
+            resolved.append(zone)
+    if unknown:
+        raise ValueError(
+            f"Unknown zone(s): {', '.join(unknown)}. Available zones: "
+            + (", ".join(ZONE_NAMES) or "none")
+            + "."
+        )
+    return resolved
+
+
+def _set_cameras_default(camera_ids: list[int]) -> list[dict[str, Any]]:
     if not camera_ids:
         return []
     with ThreadPoolExecutor(max_workers=min(8, len(camera_ids))) as executor:
-        return list(executor.map(lambda camera_id: call_pi_set_mode(camera_id, "default"), camera_ids))
+        raw_results = list(
+            executor.map(lambda camera_id: call_pi_set_mode(camera_id, "default"), camera_ids)
+        )
+    return [
+        {"camera_id": camera_id, "zone": CAMERAS[camera_id]["zone"], "result": result}
+        for camera_id, result in zip(camera_ids, raw_results)
+    ]
 
 
-def get_operational_mode_tool() -> dict:
+def get_operational_mode_tool(zones: Any = None) -> dict:
+    try:
+        selected_zones = _coerce_zone_names(zones)
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}
     with _orchestration_lock:
         with _operational_lock:
-            mode = _operational_state["mode"]
-            return {
-                "status": "ok",
-                "mode": mode,
-                "objective": _operational_state["objective"],
-                "scanner_running": _scanner_running_for_mode(mode),
-                "placeholder": mode in PLACEHOLDER_OPERATIONAL_MODES,
-            }
+            all_states = _zone_state_payload_locked()
+            selected_states = [
+                state for state in all_states if state["zone"] in selected_zones
+            ]
+    summary = _summarize_zone_payload(selected_states)
+    return {
+        "status": "ok",
+        **summary,
+        "zones": selected_states,
+    }
 
 
 def get_safety_state_tool(timeout_sec: float = 2.0) -> dict:
@@ -364,12 +468,16 @@ def clear_safety_hazard(reason: Optional[str] = None) -> dict:
         "receiver_synced": True,
         "message": (
             "Construction safety state cleared by the operator. The dashboard is green unless "
-            "the Safety scanner detects a new hazard."
+            "a Safety scanner detects a new hazard."
         ),
     }
 
 
-def set_operational_mode(mode: str, objective: Optional[str] = None) -> dict:
+def set_operational_mode(
+    mode: str,
+    objective: Optional[str] = None,
+    zones: Any = None,
+) -> dict:
     clean_mode = str(mode or "").strip().lower()
     clean_objective = str(objective or "").strip() or None
     if clean_mode not in OPERATIONAL_MODES:
@@ -387,225 +495,115 @@ def set_operational_mode(mode: str, objective: Optional[str] = None) -> dict:
         }
     if clean_mode in {"free", "safety"}:
         clean_objective = None
+    try:
+        target_zones = _coerce_zone_names(zones)
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}
+    if not target_zones:
+        return {"status": "error", "error": "No zones are configured."}
 
     with _orchestration_lock:
-        return _set_operational_mode_locked(clean_mode, clean_objective)
+        return _set_operational_mode_locked(clean_mode, clean_objective, target_zones)
 
 
-def _set_operational_mode_locked(clean_mode: str, clean_objective: Optional[str]) -> dict:
+def _set_operational_mode_locked(
+    clean_mode: str,
+    clean_objective: Optional[str],
+    target_zones: list[str],
+) -> dict:
     with _operational_lock:
-        previous_mode = _operational_state["mode"]
-        _operational_state["mode"] = clean_mode
-        _operational_state["objective"] = clean_objective
+        previous_states = {
+            zone: dict(_zone_states[zone])
+            for zone in target_zones
+        }
+        for zone in target_zones:
+            _zone_states[zone] = {
+                "mode": clean_mode,
+                "objective": clean_objective,
+            }
+
+    for zone in target_zones:
+        search_scanners[zone].stop()
+        safety_scanners[zone].stop()
+
+    # Publish the new desired states with target scanners stopped. Search and
+    # Safety only start after the receiver acknowledges every zone objective.
+    _publish_operational_state()
+
+    target_camera_ids = sorted(
+        camera_id
+        for zone in target_zones
+        for camera_id in ZONES[zone]
+    )
+    camera_results = (
+        _set_cameras_default(target_camera_ids)
+        if clean_mode in {"free", "safety", "search"}
+        else []
+    )
+    receiver_synced = _reconcile_operational_state()
+    failed = [
+        item for item in camera_results
+        if item["result"].get("status") != "ok"
+    ]
+    with _operational_lock:
+        selected_states = [
+            state
+            for state in _zone_state_payload_locked()
+            if state["zone"] in target_zones
+        ]
+    scanner_running = any(state["scanner_running"] for state in selected_states)
+    zone_text = ", ".join(target_zones)
 
     if clean_mode == "free":
-        search_scanner.stop()
-        safety_scanner.stop()
-        camera_results = _set_all_cameras_default()
-        receiver_synced = _publish_operational_state()
-        failed = [
-            {
-                "camera_id": camera_id,
-                "result": result,
-            }
-            for camera_id, result in zip(sorted(CAMERAS.keys()), camera_results)
-            if result.get("status") != "ok"
-        ]
-
-        if not CAMERAS:
-            message = (
-                "Free Mode activated. Automated scanning is stopped; no cameras are registered."
-            )
-        elif failed:
-            failed_ids = ", ".join(str(item["camera_id"]) for item in failed)
-            message = (
-                "Free Mode is active and automated scanning is stopped, but camera(s) "
-                f"{failed_ids} could not be set to default processing mode."
-            )
-        else:
-            message = (
-                "Free Mode activated. Automated scanning is stopped and all registered cameras "
-                "are in default processing mode for unprocessed live viewing."
-            )
-        if not receiver_synced:
-            message += " The receiver status update is pending."
-
-        _post_system_log(kind="mode", level="info", message=message)
-        if failed:
-            failed_ids = ", ".join(str(item["camera_id"]) for item in failed)
-            _post_system_log(
-                kind="mode",
-                level="warning",
-                message=f"Free Mode could not normalize camera(s): {failed_ids}.",
-            )
-
-        return {
-            "status": "ok" if not failed and receiver_synced else "partial_error",
-            "mode": "free",
-            "objective": None,
-            "scanner_running": False,
-            "placeholder": False,
-            "receiver_synced": receiver_synced,
-            "camera_results": camera_results,
-            "message": message,
-        }
-
-    if clean_mode == "safety":
-        search_scanner.stop()
-        safety_scanner.stop()
-
-        # Publish the selected mode with scanning stopped before normalizing the
-        # fleet. Reconciliation only starts the VLM scanner after the receiver
-        # has acknowledged the state.
-        _publish_operational_state()
-        camera_results = _set_all_cameras_default()
-        receiver_synced = _reconcile_operational_state()
-        scanner_running = safety_scanner.is_running()
-        failed = [
-            {
-                "camera_id": camera_id,
-                "result": result,
-            }
-            for camera_id, result in zip(sorted(CAMERAS.keys()), camera_results)
-            if result.get("status") != "ok"
-        ]
-
+        message = (
+            f"Free Mode activated for {zone_text}. Automated scanning is stopped and "
+            "the zone cameras are in default processing mode."
+        )
+    elif clean_mode == "safety":
         hours = (
             f"{SAFETY_ACCESS_START_HOUR:02d}:00-{SAFETY_ACCESS_END_HOUR:02d}:00 "
             f"{SAFETY_SITE_TIMEZONE}"
         )
         message = (
-            f"Safety Mode activated. From {hours}, active camera frames are checked for Fire "
-            "Hazard and Work-Zone Intrusion in one VLM pass. Outside that window, they are "
-            "checked for Fire Hazard and Unauthorized Entry."
+            f"Safety Mode activated for {zone_text}. From {hours}, the selected zone cameras "
+            "are checked for Fire Hazard and Work-Zone Intrusion; outside that window they "
+            "are checked for Fire Hazard and Unauthorized Entry."
         )
-        if not CAMERAS:
-            message += " No cameras are registered."
-        elif failed:
-            failed_ids = ", ".join(str(item["camera_id"]) for item in failed)
-            message += f" Camera(s) {failed_ids} could not be set to default processing mode."
-        if not receiver_synced:
-            if scanner_running:
-                message += " The Safety scanner is running; its receiver status update is pending."
-            else:
-                message += " The Safety scanner is waiting for the receiver to acknowledge the mode."
-
-        _post_system_log(kind="mode", level="info", message=message)
-        if failed:
-            failed_ids = ", ".join(str(item["camera_id"]) for item in failed)
-            _post_system_log(
-                kind="mode",
-                level="warning",
-                message=f"Safety Mode could not reach camera(s): {failed_ids}.",
-            )
-        if not receiver_synced:
-            _post_system_log(
-                kind="mode",
-                level="warning",
-                message=(
-                    "The Safety scanner is running, but its latest status has not reached the receiver."
-                    if scanner_running
-                    else (
-                        "Safety Mode could not synchronize with the receiver. Scanning will start "
-                        "automatically after synchronization recovers."
-                    )
-                ),
-            )
-
-        return {
-            "status": "ok" if not failed and receiver_synced else "partial_error",
-            "mode": "safety",
-            "objective": None,
-            "scanner_running": scanner_running,
-            "placeholder": False,
-            "receiver_synced": receiver_synced,
-            "camera_results": camera_results,
-            "message": message,
-        }
-
-    if clean_mode in PLACEHOLDER_OPERATIONAL_MODES:
-        search_scanner.stop()
-        safety_scanner.stop()
-        receiver_synced = _publish_operational_state()
-        label = clean_mode.title()
+    elif clean_mode == "investigation":
         message = (
-            f"{label} Mode selected. Its camera-orchestration workflow is a placeholder "
-            "and will be configured when its requirements are finalized."
+            f"Investigation Mode selected for {zone_text}. Its camera-orchestration workflow "
+            "is a placeholder."
         )
-        if not receiver_synced:
-            message += " The receiver status update is pending."
-        _post_system_log(kind="mode", level="info", message=message)
-        return {
-            "status": "ok" if receiver_synced else "partial_error",
-            "mode": clean_mode,
-            "objective": clean_objective,
-            "scanner_running": False,
-            "placeholder": True,
-            "receiver_synced": receiver_synced,
-            "camera_results": [],
-            "message": message,
-        }
-
-    assert clean_mode == "search"
-    assert clean_objective is not None
-    safety_scanner.stop()
-    search_was_running = previous_mode == "search" and search_scanner.is_running()
-    if search_was_running:
-        search_scanner.stop()
-        message = f"Search target updated: {clean_objective}"
     else:
-        message = f"Search Mode activated: {clean_objective}"
+        was_search = any(state["mode"] == "search" for state in previous_states.values())
+        verb = "Search target updated" if was_search else "Search Mode activated"
+        message = f"{verb} for {zone_text}: {clean_objective}"
 
-    # Announce the new objective while scanning is stopped, then normalize all
-    # cameras again so retargeting also recovers Pis that were offline or reset.
-    _publish_operational_state()
-    camera_results = _set_all_cameras_default()
-    receiver_synced = _reconcile_operational_state()
-    scanner_running = search_scanner.is_running()
-    if not receiver_synced:
-        if scanner_running:
-            message += " The scanner is running; its receiver status update is pending."
-        else:
-            message += " The Search scanner is waiting for the receiver to acknowledge the objective."
-    _post_system_log(kind="mode", level="info", message=message)
-
-    failed = [
-        {
-            "camera_id": camera_id,
-            "result": result,
-        }
-        for camera_id, result in zip(sorted(CAMERAS.keys()), camera_results)
-        if result.get("status") != "ok"
-    ]
     if failed:
         failed_ids = ", ".join(str(item["camera_id"]) for item in failed)
+        message += f" Camera(s) {failed_ids} could not be set to default processing mode."
         _post_system_log(
             kind="mode",
             level="warning",
-            message=f"Search Mode could not reach camera(s): {failed_ids}.",
+            message=f"{clean_mode.title()} Mode could not reach camera(s): {failed_ids}.",
         )
-
     if not receiver_synced:
-        synchronization_detail = (
-            "The Search scanner is running, but its latest status has not reached the receiver."
-            if scanner_running
-            else (
-                "Search Mode could not synchronize its objective with the receiver. "
-                "Scanning will start automatically after synchronization recovers."
-            )
-        )
-        _post_system_log(
-            kind="mode",
-            level="warning",
-            message=synchronization_detail,
-        )
+        if scanner_running:
+            message += " Scanning is running, but its receiver status update is pending."
+        elif clean_mode in {"search", "safety"}:
+            message += " Scanning is waiting for the receiver to acknowledge the zone state."
+        else:
+            message += " The receiver status update is pending."
 
+    _post_system_log(kind="mode", level="info", message=message)
     return {
         "status": "ok" if not failed and receiver_synced else "partial_error",
-        "mode": "search",
+        "mode": clean_mode,
         "objective": clean_objective,
+        "target_zones": target_zones,
+        "zones": selected_states,
         "scanner_running": scanner_running,
-        "placeholder": False,
+        "placeholder": clean_mode in PLACEHOLDER_OPERATIONAL_MODES,
         "receiver_synced": receiver_synced,
         "camera_results": camera_results,
         "message": message,
@@ -748,7 +746,7 @@ tools = [
         "name": "list_cameras",
         "description": (
             "List every camera known to the supervisor, including its id, name, "
-            "location and the Pi host it runs on. Call this when the user asks "
+            "location, zone, and the Pi host it runs on. Call this when the user asks "
             "what cameras exist, or when a request is ambiguous about which camera to target."
         ),
         "parameters": {"type": "object", "properties": {}},
@@ -757,8 +755,9 @@ tools = [
         "type": "function",
         "name": "set_operational_mode",
         "description": (
-            "Select the fleet-wide operational mode. Free Mode stops Search and sets every reachable "
-            "camera to default processing for unprocessed live viewing. Search Mode configures cameras "
+            "Select the operational mode for one or more construction zones. If zones are omitted, "
+            "the command applies to all zones. Free Mode stops Search and sets cameras in the selected "
+            "zones to default processing. Search Mode configures those cameras "
             "for raw streaming and starts laptop-side VLM scanning for any visible target, including "
             "people, animals, vehicles, equipment, or other objects. Safety Mode configures cameras "
             "for raw streaming and scans each frame for construction hazards. Investigation Mode is "
@@ -771,7 +770,7 @@ tools = [
                 "mode": {
                     "type": "string",
                     "enum": ["free", "safety", "search", "investigation"],
-                    "description": "The fleet-wide operational mode to select.",
+                    "description": "The operational mode to select for the target zones.",
                 },
                 "objective": {
                     "type": "string",
@@ -779,6 +778,13 @@ tools = [
                         "The operator's objective. Required for Search Mode as a concise visual target "
                         "description, for example 'red fire extinguisher' or 'child in a blue jacket'. "
                         "Unused for Free and Safety Modes and optional for Investigation Mode."
+                    ),
+                },
+                "zones": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": list(ZONE_NAMES)},
+                    "description": (
+                        "Target zone names. Omit only when the operator explicitly wants all zones."
                     ),
                 },
             },
@@ -789,10 +795,18 @@ tools = [
         "type": "function",
         "name": "get_operational_mode",
         "description": (
-            "Report the current fleet-wide operational mode, its objective, whether its workflow is "
-            "a placeholder, and whether that mode's scanner is running."
+            "Report operational mode, objective, placeholder state, and scanner status per zone. "
+            "If zones are omitted, report every zone."
         ),
-        "parameters": {"type": "object", "properties": {}},
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "zones": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": list(ZONE_NAMES)},
+                }
+            },
+        },
     },
     {
         "type": "function",
@@ -824,8 +838,8 @@ tools = [
         "type": "function",
         "name": "get_reporting_status",
         "description": (
-            "Check hourly construction-report snapshot coverage for a date without changing the "
-            "current operational mode. If date is omitted, use the current site-local date."
+            "Check hourly construction-report snapshot coverage for one or more zones without "
+            "changing operational mode. If date is omitted, use the current site-local date."
         ),
         "parameters": {
             "type": "object",
@@ -833,7 +847,12 @@ tools = [
                 "report_date": {
                     "type": "string",
                     "description": "Optional date in YYYY-MM-DD format.",
-                }
+                },
+                "zones": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": list(ZONE_NAMES)},
+                    "description": "Optional zones to inspect; omit to inspect all zones.",
+                },
             },
         },
     },
@@ -841,10 +860,10 @@ tools = [
         "type": "function",
         "name": "generate_daily_report",
         "description": (
-            "Generate a PDF construction progress report from the requested day's hourly camera "
-            "snapshots. This does not switch operational mode. Include the operator's stated daily "
-            "goal when provided; it improves progress and completion reasoning. If date is omitted, "
-            "use the current site-local date."
+            "Generate a separate PDF construction progress report for each requested zone from that "
+            "zone's hourly camera snapshots. This does not switch operational mode. Include the "
+            "operator's stated daily goal when provided. If date is omitted, use the current "
+            "site-local date."
         ),
         "parameters": {
             "type": "object",
@@ -859,7 +878,13 @@ tools = [
                         "Optional construction goal for that day, copied faithfully from the operator."
                     ),
                 },
+                "zones": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": list(ZONE_NAMES)},
+                    "description": "One or more zones; each receives its own PDF report.",
+                },
             },
+            "required": ["zones"],
         },
     },
 ]
@@ -871,8 +896,19 @@ def _camera_roster_text() -> str:
     lines = []
     for cid, info in sorted(CAMERAS.items()):
         loc = f" — {info['location']}" if info.get("location") else ""
-        lines.append(f"  - id {cid}: {info['name']}{loc} (Pi {info.get('pi_host')})")
-    return "Registered cameras:\n" + "\n".join(lines)
+        lines.append(
+            f"  - id {cid}: {info['name']}{loc}; zone {info['zone']} (Pi {info.get('pi_host')})"
+        )
+    zone_lines = [
+        f"  - {zone}: camera ids {', '.join(str(camera_id) for camera_id in camera_ids)}"
+        for zone, camera_ids in sorted(ZONES.items())
+    ]
+    return (
+        "Registered cameras:\n"
+        + "\n".join(lines)
+        + "\nConfigured zones:\n"
+        + "\n".join(zone_lines)
+    )
 
 
 SYSTEM_PROMPT = f"""
@@ -898,24 +934,28 @@ Behaviour rules:
   above.
 - Use `list_cameras` when the user asks what cameras exist, or when a request
   does not specify which camera_id to act on and you need to list the options.
-- Separate from per-camera processing modes, the fleet has four operational
-  modes: `free`, `safety`, `search`, and `investigation`. It starts
-  in Free Mode.
+- Separate from per-camera processing modes, every construction zone has its
+  own operational mode: `free`, `safety`, `search`, or `investigation`. Every
+  zone starts in Free Mode, and different zones can run different modes at the
+  same time.
 - Use `set_operational_mode` whenever the operator asks to enter or switch an
-  operational mode. Use `get_operational_mode` when asked which operational
-  mode is active or what objective it is pursuing.
-- Search Mode is the implemented fleet-wide visual-search workflow. When the
+  operational mode. Pass exactly the requested zone names. If the operator
+  explicitly says all zones, omit `zones` or pass every configured zone. Never
+  change an unmentioned zone. Use `get_operational_mode` when asked which modes
+  and objectives are active.
+- Search Mode is the implemented zone-wide visual-search workflow. When the
   operator explicitly asks for Search Mode, or asks the system to find or
   locate a described target across cameras, call `set_operational_mode` with
-  mode `search` and a concise objective copied from the request. The target can
+  mode `search`, the requested zones, and a concise objective copied from the request. The target can
   be any visibly identifiable person, animal, vehicle, equipment, or object.
   Do not ask for confirmation when a target description is already present; if
   it is missing, ask what the system should search for.
-- In Search Mode, all reachable cameras remain in `default` processing mode
+- In Search Mode, cameras in that zone remain in `default` processing mode
   while the laptop-side VLM scanner inspects active streams. Reject requests to
   move individual cameras to other processing modes until Search Mode is left.
-- Safety Mode is the implemented continuous construction-safety workflow. It
-  keeps every reachable camera in `default` processing mode and evaluates each
+- Safety Mode is the implemented continuous construction-safety workflow for
+  the selected zone. It keeps that zone's reachable cameras in `default`
+  processing mode and evaluates each
   sampled frame once against exactly two applicable checks. During the configured
   09:00-17:00 site-local construction window, those checks are `Fire Hazard`
   and `Work-Zone Intrusion`. Outside that window, machinery is considered off,
@@ -927,16 +967,16 @@ Behaviour rules:
   reset, or acknowledge the safety state. Never clear it merely because the
   operator selects another mode. Use `get_safety_state` when asked whether the
   construction site is currently clear or which hazards are active.
-- In Safety Mode, cameras are also locked to `default` processing so the Safety
+- In Safety Mode, cameras in that zone are locked to `default` processing so the Safety
   scanner continues receiving unmodified frames. Reject requests to move an
   individual camera to another processing mode until Safety Mode is left.
-- Free Mode is the neutral live-view baseline. Selecting it stops Search,
-  stops Safety scanning, clears the Search objective, and sets every reachable
-  camera to `default` processing mode so the operator sees unprocessed footage
-  with no automated scanner or operational workflow running. Free Mode does
+- Free Mode is the neutral live-view baseline for a zone. Selecting it stops
+  Search and Safety scanning in the selected zones, clears their Search
+  objectives, and sets their reachable cameras to `default` processing mode.
+  Free Mode does
   not clear a latched construction safety hazard.
-- Investigation Mode is a placeholder until its workflow is defined. Still
-  call `set_operational_mode` when it is requested, then clearly explain that
+- Investigation Mode is a per-zone placeholder until its workflow is defined.
+  Still call `set_operational_mode` when it is requested, then clearly explain that
   no automatic camera reconfiguration is configured for it yet.
 - Daily reporting is not an operational mode and never interrupts the active
   operational mode. A passive recorder saves one fresh frame per registered
@@ -944,22 +984,24 @@ Behaviour rules:
   {REPORTING_CAPTURE_END_HOUR:02d}:00 in {REPORTING_SITE_TIMEZONE}. Use
   `get_reporting_status` when asked what evidence is available for a date.
 - Use `generate_daily_report` when the operator asks for a daily construction
-  report. Pass the requested date in YYYY-MM-DD form; if the operator says
+  report. A zone is required. Pass every requested zone and create a separate
+  PDF for each. Pass the requested date in YYYY-MM-DD form; if the operator says
   "today", omit the date so the site-local current date is used. Pass the
   operator's goal exactly when one is provided. Do not ask for a goal because
   it is optional. The tool compares each camera's ordered daily sequence,
   synthesizes the camera observations, and creates a PDF. In text chat, present
   the returned `report_url` as a Markdown link. If someone asks to enter
   Reporting Mode, explain that reporting now runs in the background and ask
-  which day's report they want instead of changing operational mode.
+  which zone and day they want instead of changing operational mode.
 - If the operator asks to stop or cancel Search Mode without naming a next
-  operational mode, switch to Free Mode.
+  operational mode, switch the referenced zones to Free Mode. Ask which zone
+  only when it cannot be inferred; do not stop Search in other zones.
 - If the user targets a camera that is not registered, politely say so and list
   the available camera ids.
 - After any camera tool result, explain clearly what happened. On success,
   confirm the camera (by id and name) and processing mode. On error, explain
   the problem in simple terms and suggest what to try.
-- After an operational-mode result, confirm the selected mode and objective.
+- After an operational-mode result, confirm the selected zones, mode, and objective.
   If the result says it is a placeholder, always say so plainly.
 - For casual chat, respond normally without mentioning cameras.
 """
@@ -975,10 +1017,61 @@ Voice conversation rules:
 - Do not read raw JSON or internal tool names out loud. Summarize the result in
   plain language after a tool call finishes.
 - When a command changes camera state, briefly confirm the camera id, name, and
-  new processing mode. When it changes the fleet's operational mode, confirm
-  that mode and its objective. When a command is ambiguous, ask a short
+  new processing mode. When it changes operational mode, confirm the zones,
+  mode, and objective. When a command is ambiguous, ask a short
   clarifying question.
 """
+
+
+def get_reporting_status_for_zones(
+    report_date: Optional[str] = None,
+    zones: Any = None,
+) -> dict:
+    selected_zones = _coerce_zone_names(zones)
+    statuses = [
+        reporting_service.get_status(report_date, zone)
+        for zone in selected_zones
+    ]
+    return {
+        "status": "ok",
+        "date": statuses[0]["date"] if statuses else report_date,
+        "zones": statuses,
+        "message": f"Reporting coverage returned for {len(statuses)} zone(s).",
+    }
+
+
+def generate_daily_reports_for_zones(
+    report_date: Optional[str],
+    zones: Any,
+    goal: Optional[str] = None,
+) -> dict:
+    if zones is None:
+        raise ValueError("At least one zone is required to generate a daily report.")
+    selected_zones = _coerce_zone_names(zones)
+    reports = [
+        reporting_service.generate_daily_report(report_date, zone, goal)
+        for zone in selected_zones
+    ]
+    ok_count = sum(report.get("status") == "ok" for report in reports)
+    usable_count = sum(report.get("status") in {"ok", "partial_error"} for report in reports)
+    if ok_count == len(reports):
+        status = "ok"
+    elif usable_count:
+        status = "partial_error"
+    else:
+        status = "error"
+    result = {
+        "status": status,
+        "target_zones": selected_zones,
+        "reports": reports,
+        "message": (
+            f"Generated {usable_count} of {len(reports)} requested zone report(s)."
+        ),
+    }
+    if len(reports) == 1:
+        result.update(reports[0])
+        result["reports"] = reports
+    return result
 
 
 def execute_supervisor_tool(tool_name: str, args: Any) -> dict:
@@ -1004,14 +1097,22 @@ def execute_supervisor_tool(tool_name: str, args: Any) -> dict:
             }
         with _orchestration_lock:
             with _operational_lock:
-                current_operational_mode = _operational_state["mode"]
-            if current_operational_mode in {"search", "safety"} and mode != "default":
-                label = current_operational_mode.title()
+                locked_zones = {
+                    CAMERAS[camera_id]["zone"]: _zone_states[CAMERAS[camera_id]["zone"]]["mode"]
+                    for camera_id in camera_ids
+                    if camera_id in CAMERAS
+                    and _zone_states[CAMERAS[camera_id]["zone"]]["mode"] in {"search", "safety"}
+                }
+            if locked_zones and mode != "default":
+                details = ", ".join(
+                    f"{zone} ({operational_mode.title()} Mode)"
+                    for zone, operational_mode in sorted(locked_zones.items())
+                )
                 return {
                     "status": "error",
                     "error": (
-                        f"{label} Mode is active. Cameras are locked to default processing mode "
-                        "until another operational mode is selected."
+                        f"Camera processing is locked to default in: {details}. "
+                        "Change those zone modes first."
                     ),
                 }
             results = [call_pi_set_mode(camera_id, mode) for camera_id in camera_ids]
@@ -1035,10 +1136,11 @@ def execute_supervisor_tool(tool_name: str, args: Any) -> dict:
         return set_operational_mode(
             str(args.get("mode") or ""),
             args.get("objective"),
+            args.get("zones", args.get("zone")),
         )
 
     if tool_name == "get_operational_mode":
-        return get_operational_mode_tool()
+        return get_operational_mode_tool(args.get("zones", args.get("zone")))
 
     if tool_name == "get_safety_state":
         return get_safety_state_tool()
@@ -1048,14 +1150,18 @@ def execute_supervisor_tool(tool_name: str, args: Any) -> dict:
 
     if tool_name == "get_reporting_status":
         try:
-            return reporting_service.get_status(args.get("report_date"))
+            return get_reporting_status_for_zones(
+                args.get("report_date"),
+                args.get("zones", args.get("zone")),
+            )
         except ValueError as exc:
             return {"status": "error", "error": str(exc)}
 
     if tool_name == "generate_daily_report":
         try:
-            return reporting_service.generate_daily_report(
+            return generate_daily_reports_for_zones(
                 args.get("report_date"),
+                args.get("zones", args.get("zone")),
                 args.get("goal"),
             )
         except ValueError as exc:
@@ -1363,6 +1469,11 @@ SUPERVISOR_CSS = """
   border-color: rgba(56, 189, 248, 0.42);
   background: rgba(56, 189, 248, 0.14);
   color: #7dd3fc;
+}
+.sup-mode-chip.mixed {
+  border-color: rgba(168, 85, 247, 0.48);
+  background: rgba(126, 34, 206, 0.16);
+  color: #d8b4fe;
 }
 .sup-mode-chip.hazard {
   border-color: rgba(248, 113, 113, 0.78);
@@ -2241,15 +2352,20 @@ SUPERVISOR_JS = r"""
       try {
         const res = await fetch("/operational/state");
         const state = await res.json();
-        const mode = ["free", "safety", "search", "investigation"].includes(state.mode)
+        const mode = ["free", "safety", "search", "investigation", "mixed"].includes(state.mode)
           ? state.mode
           : "free";
         const hazard = state.safety_status === "hazard";
-        chip.classList.remove("free", "safety", "search", "investigation", "hazard");
+        chip.classList.remove("free", "safety", "search", "investigation", "mixed", "hazard");
         chip.classList.add(mode);
         if (hazard) chip.classList.add("hazard");
         const modeLabel = mode.charAt(0).toUpperCase() + mode.slice(1);
         label.textContent = hazard ? "Stop work · " + modeLabel : modeLabel;
+        const zoneStates = Array.isArray(state.zones) ? state.zones : [];
+        chip.title = zoneStates.map((item) => {
+          const objective = item.objective ? " - " + item.objective : "";
+          return item.zone + ": " + item.mode + objective;
+        }).join("\n");
       } catch (error) {
         label.textContent = "Unknown";
       }
@@ -2276,7 +2392,7 @@ def _supervisor_header_html() -> str:
     return """<header class="sup-page-header">
   <div class="sup-title-block">
     <h1>Supervisor</h1>
-    <p class="sup-sub">Natural-language control for your multi-camera fleet — select an operational mode, configure cameras, or read status.</p>
+    <p class="sup-sub">Natural-language control for your multi-camera zones — select modes, configure cameras, or read status.</p>
   </div>
   <div class="sup-mode-chip free" id="sup-mode-chip"><span class="sup-mode-dot"></span><span id="sup-mode-label">Free</span></div>
 </header>"""
@@ -2296,6 +2412,7 @@ def _camera_roster_html() -> str:
         host = info.get("pi_host")
         host_e = html.escape(str(host)) if host else ""
         line2_parts = []
+        line2_parts.append(html.escape(str(info.get("zone") or "Unassigned")))
         if loc_e:
             line2_parts.append(loc_e)
         if host_e:

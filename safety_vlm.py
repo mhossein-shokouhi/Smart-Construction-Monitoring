@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 from datetime import datetime
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from zoneinfo import ZoneInfo
 
 import requests
@@ -59,6 +59,8 @@ class SafetyScanner(SearchScanner):
         access_start_hour: int = 9,
         access_end_hour: int = 17,
         now_provider: Callable[[], datetime] | None = None,
+        camera_ids: Iterable[int] | None = None,
+        scope_label: str | None = None,
     ) -> None:
         super().__init__(
             client=client,
@@ -69,6 +71,8 @@ class SafetyScanner(SearchScanner):
             match_threshold=match_threshold,
             alert_cooldown_sec=alert_cooldown_sec,
             max_workers=max_workers,
+            camera_ids=camera_ids,
+            scope_label=scope_label,
         )
         if not 0 <= access_start_hour <= 23 or not 0 <= access_end_hour <= 23:
             raise ValueError("Safety access hours must be integers from 0 through 23.")

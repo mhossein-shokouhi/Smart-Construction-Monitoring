@@ -6,6 +6,7 @@ import base64
 import html
 import json
 import os
+import re
 import tempfile
 import threading
 import time
@@ -26,6 +27,7 @@ class ReportingSnapshot:
     camera_id: int
     camera_name: str
     camera_location: str
+    camera_zone: str
     slot_hour: int
     scheduled_at: str
     captured_at: str
@@ -38,6 +40,7 @@ class ReportingSnapshot:
             "camera_id": self.camera_id,
             "camera_name": self.camera_name,
             "camera_location": self.camera_location,
+            "zone": self.camera_zone,
             "scheduled_at": self.scheduled_at,
             "captured_at": self.captured_at,
         }
@@ -82,6 +85,12 @@ class ConstructionReporting:
         self.client = client
         self.receiver_url = receiver_url.rstrip("/")
         self.cameras = {int(camera_id): dict(info) for camera_id, info in cameras.items()}
+        self.zones: dict[str, list[int]] = {}
+        for camera_id, camera in sorted(self.cameras.items()):
+            zone = str(camera.get("zone") or "Unassigned").strip() or "Unassigned"
+            camera["zone"] = zone
+            self.zones.setdefault(zone, []).append(camera_id)
+        self._zone_lookup = {zone.casefold(): zone for zone in self.zones}
         self.model = model
         self.image_detail = image_detail
         self.reasoning_effort = reasoning_effort
@@ -221,6 +230,7 @@ class ConstructionReporting:
                     "camera_id": camera_id,
                     "camera_name": str(camera.get("name") or f"Camera {camera_id}"),
                     "camera_location": str(camera.get("location") or ""),
+                    "camera_zone": str(camera.get("zone") or "Unassigned"),
                     "slot_hour": now.hour,
                     "scheduled_at": scheduled_at,
                     "captured_at": captured_at,
@@ -313,8 +323,13 @@ class ConstructionReporting:
             except FileNotFoundError:
                 pass
 
-    def list_snapshots(self, report_date: str) -> list[ReportingSnapshot]:
+    def list_snapshots(
+        self,
+        report_date: str,
+        zone: str | None = None,
+    ) -> list[ReportingSnapshot]:
         clean_date = self._validate_report_date(report_date)
+        clean_zone = self._resolve_zone(zone) if zone is not None else None
         day_dir = self.snapshot_root / clean_date
         snapshots: list[ReportingSnapshot] = []
         if not day_dir.is_dir():
@@ -325,12 +340,21 @@ class ConstructionReporting:
                 continue
             try:
                 metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                camera_id = int(metadata["camera_id"])
+                camera_zone = str(
+                    metadata.get("camera_zone")
+                    or self.cameras.get(camera_id, {}).get("zone")
+                    or "Unassigned"
+                )
+                if clean_zone is not None and camera_zone.casefold() != clean_zone.casefold():
+                    continue
                 snapshots.append(
                     ReportingSnapshot(
                         report_date=clean_date,
-                        camera_id=int(metadata["camera_id"]),
+                        camera_id=camera_id,
                         camera_name=str(metadata.get("camera_name") or "Camera"),
                         camera_location=str(metadata.get("camera_location") or ""),
+                        camera_zone=camera_zone,
                         slot_hour=int(metadata["slot_hour"]),
                         scheduled_at=str(metadata["scheduled_at"]),
                         captured_at=str(metadata["captured_at"]),
@@ -342,12 +366,19 @@ class ConstructionReporting:
                 continue
         return sorted(snapshots, key=lambda item: (item.camera_id, item.slot_hour, item.captured_at))
 
-    def get_status(self, report_date: str | None = None) -> dict[str, Any]:
+    def get_status(
+        self,
+        report_date: str | None = None,
+        zone: str | None = None,
+    ) -> dict[str, Any]:
         clean_date = self._validate_report_date(report_date or self._site_now().date().isoformat())
-        snapshots = self.list_snapshots(clean_date)
+        clean_zone = self._resolve_zone(zone) if zone is not None else None
+        snapshots = self.list_snapshots(clean_date, clean_zone)
         grouped = self._group_snapshots(snapshots)
         camera_coverage = []
         for camera_id, camera in sorted(self.cameras.items()):
+            if clean_zone is not None and camera.get("zone") != clean_zone:
+                continue
             records = grouped.get(camera_id, [])
             camera_coverage.append(
                 {
@@ -361,23 +392,27 @@ class ConstructionReporting:
         return {
             "status": "ok",
             "date": clean_date,
+            "zone": clean_zone,
             "recorder_running": self.is_running(),
             "site_timezone": self.site_timezone_name,
             "scheduled_times": [f"{hour:02d}:00" for hour in self.scheduled_hours],
             "snapshot_count": len(snapshots),
             "camera_coverage": camera_coverage,
             "message": (
-                f"{len(snapshots)} reporting snapshot(s) are available for {clean_date}."
+                f"{len(snapshots)} reporting snapshot(s) are available for {clean_date}"
+                + (f" in {clean_zone}." if clean_zone else " across all zones.")
             ),
         }
 
     def generate_daily_report(
         self,
         report_date: str | None = None,
+        zone: str | None = None,
         goal: str | None = None,
     ) -> dict[str, Any]:
-        """Analyze one day's ordered frames and write a locally generated PDF."""
+        """Analyze one zone's ordered daily frames and write a zone-specific PDF."""
         clean_date = self._validate_report_date(report_date or self._site_now().date().isoformat())
+        clean_zone = self._resolve_zone(zone)
         clean_goal = str(goal or "").strip() or None
         if clean_date > self._site_now().date().isoformat():
             return {"status": "error", "error": "A report cannot be generated for a future date."}
@@ -385,13 +420,14 @@ class ConstructionReporting:
         with self._report_lock:
             if clean_date == self._site_now().date().isoformat():
                 self.capture_due()
-            snapshots = self.list_snapshots(clean_date)
+            snapshots = self.list_snapshots(clean_date, clean_zone)
             if not snapshots:
                 return {
                     "status": "error",
                     "date": clean_date,
+                    "zone": clean_zone,
                     "error": (
-                        f"No scheduled camera snapshots are available for {clean_date}. "
+                        f"No scheduled camera snapshots are available for {clean_zone} on {clean_date}. "
                         "The hourly recorder only captures fresh frames from 09:00 through 17:00."
                     ),
                 }
@@ -416,16 +452,23 @@ class ConstructionReporting:
                 return {
                     "status": "error",
                     "date": clean_date,
+                    "zone": clean_zone,
                     "snapshot_count": len(snapshots),
                     "errors": analysis_errors,
                     "error": "The VLM could not analyze any camera sequence for this report.",
                 }
 
             analyses.sort(key=lambda item: int(item.get("camera_id", 0)))
-            coverage = self._coverage_summary(clean_date, grouped, analysis_errors)
+            coverage = self._coverage_summary(clean_date, clean_zone, grouped, analysis_errors)
             synthesis_error: str | None = None
             try:
-                report = self._synthesize_report(clean_date, clean_goal, analyses, coverage)
+                report = self._synthesize_report(
+                    clean_date,
+                    clean_zone,
+                    clean_goal,
+                    analyses,
+                    coverage,
+                )
             except Exception as exc:
                 synthesis_error = str(exc)
                 report = self._fallback_report(clean_date, clean_goal, analyses, coverage)
@@ -433,6 +476,7 @@ class ConstructionReporting:
             try:
                 pdf_path = self._write_pdf(
                     report_date=clean_date,
+                    zone=clean_zone,
                     goal=clean_goal,
                     report=report,
                     analyses=analyses,
@@ -443,12 +487,13 @@ class ConstructionReporting:
                 return {
                     "status": "error",
                     "date": clean_date,
+                    "zone": clean_zone,
                     "snapshot_count": len(snapshots),
                     "error": f"The report was analyzed but its PDF could not be created: {exc}",
                 }
 
             partial = bool(analysis_errors or synthesis_error)
-            message = f"Daily construction progress report created for {clean_date}."
+            message = f"Daily construction progress report created for {clean_zone} on {clean_date}."
             if analysis_errors:
                 missing_ids = ", ".join(str(item["camera_id"]) for item in analysis_errors)
                 message += f" Camera analysis was unavailable for: {missing_ids}."
@@ -458,6 +503,7 @@ class ConstructionReporting:
             return {
                 "status": "partial_error" if partial else "ok",
                 "date": clean_date,
+                "zone": clean_zone,
                 "goal": clean_goal,
                 "snapshot_count": len(snapshots),
                 "camera_count": len(grouped),
@@ -491,6 +537,7 @@ class ConstructionReporting:
             "are not visually supported. Account for lighting, viewpoint, and occlusion. "
             f"{goal_instruction}\n\n"
             f"Report date: {first.report_date}\n"
+            f"Zone: {first.camera_zone}\n"
             f"Camera: {first.camera_name} (id {first.camera_id})\n"
             f"Location: {first.camera_location or 'Not specified'}"
         )
@@ -531,12 +578,14 @@ class ConstructionReporting:
         result["camera_id"] = first.camera_id
         result["camera_name"] = first.camera_name
         result["camera_location"] = first.camera_location
+        result["zone"] = first.camera_zone
         result["snapshot_count"] = len(snapshots)
         return result
 
     def _synthesize_report(
         self,
         report_date: str,
+        zone: str,
         goal: str | None,
         analyses: list[dict[str, Any]],
         coverage: dict[str, Any],
@@ -551,6 +600,7 @@ class ConstructionReporting:
             + json.dumps(
                 {
                     "report_date": report_date,
+                    "zone": zone,
                     "operator_goal": goal,
                     "coverage": coverage,
                     "camera_observations": analyses,
@@ -716,11 +766,14 @@ class ConstructionReporting:
     def _coverage_summary(
         self,
         report_date: str,
+        zone: str,
         grouped: dict[int, list[ReportingSnapshot]],
         analysis_errors: list[dict[str, Any]],
     ) -> dict[str, Any]:
         cameras = []
         for camera_id, camera in sorted(self.cameras.items()):
+            if camera.get("zone") != zone:
+                continue
             records = grouped.get(camera_id, [])
             cameras.append(
                 {
@@ -733,6 +786,7 @@ class ConstructionReporting:
             )
         return {
             "date": report_date,
+            "zone": zone,
             "site_timezone": self.site_timezone_name,
             "scheduled_times": [f"{hour:02d}:00" for hour in self.scheduled_hours],
             "cameras": cameras,
@@ -811,6 +865,7 @@ class ConstructionReporting:
         self,
         *,
         report_date: str,
+        zone: str,
         goal: str | None,
         report: dict[str, Any],
         analyses: list[dict[str, Any]],
@@ -841,10 +896,13 @@ class ConstructionReporting:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         generated_at = self._site_now()
         timestamp = generated_at.strftime("%Y%m%d-%H%M%S")
-        pdf_path = self.output_dir / f"construction-progress-{report_date}-{timestamp}.pdf"
+        zone_slug = self._slugify(zone)
+        pdf_path = self.output_dir / f"construction-progress-{zone_slug}-{report_date}-{timestamp}.pdf"
         counter = 2
         while pdf_path.exists():
-            pdf_path = self.output_dir / f"construction-progress-{report_date}-{timestamp}-{counter}.pdf"
+            pdf_path = self.output_dir / (
+                f"construction-progress-{zone_slug}-{report_date}-{timestamp}-{counter}.pdf"
+            )
             counter += 1
 
         navy = colors.HexColor("#102A43")
@@ -910,7 +968,13 @@ class ConstructionReporting:
         )
 
         def clean(value: Any) -> str:
-            normalized = unicodedata.normalize("NFKD", str(value or ""))
+            printable = (
+                str(value or "")
+                .replace("\u2013", "-")
+                .replace("\u2014", "-")
+                .replace("\u2212", "-")
+            )
+            normalized = unicodedata.normalize("NFKD", printable)
             ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
             return html.escape(ascii_text).replace("\n", "<br/>")
 
@@ -950,7 +1014,7 @@ class ConstructionReporting:
             leftMargin=0.62 * inch,
             topMargin=0.72 * inch,
             bottomMargin=0.58 * inch,
-            title=f"Construction Progress Report - {report_date}",
+            title=f"Construction Progress Report - {zone} - {report_date}",
             author="Agentic Multi-Camera Operations",
         )
         story: list[Any] = []
@@ -958,6 +1022,7 @@ class ConstructionReporting:
         story.append(
             Paragraph(
                 f"REPORT DATE&nbsp;&nbsp; <b>{clean(report_date)}</b>&nbsp;&nbsp;&nbsp;&nbsp; "
+                f"ZONE&nbsp;&nbsp; <b>{clean(zone)}</b>&nbsp;&nbsp;&nbsp;&nbsp; "
                 f"GENERATED&nbsp;&nbsp; <b>{clean(generated_at.strftime('%Y-%m-%d %H:%M %Z'))}</b>",
                 subtitle_style,
             )
@@ -1070,7 +1135,7 @@ class ConstructionReporting:
             story.append(
                 Table(
                     timeline_rows,
-                    colWidths=[0.62 * inch, 2.05 * inch, 2.7 * inch, doc.width - 5.37 * inch],
+                    colWidths=[0.9 * inch, 1.8 * inch, 2.65 * inch, doc.width - 5.35 * inch],
                     repeatRows=1,
                     style=TableStyle(
                         [
@@ -1197,6 +1262,28 @@ class ConstructionReporting:
         if candidate.parent != self.output_dir or not candidate.is_file():
             return None
         return candidate
+
+    def _resolve_zone(self, value: str | None) -> str:
+        clean_value = str(value or "").strip()
+        if not clean_value:
+            raise ValueError(
+                "A zone is required for a construction progress report. Available zones: "
+                + (", ".join(sorted(self.zones)) or "none")
+                + "."
+            )
+        zone = self._zone_lookup.get(clean_value.casefold())
+        if zone is None:
+            raise ValueError(
+                f"Unknown zone '{clean_value}'. Available zones: "
+                + (", ".join(sorted(self.zones)) or "none")
+                + "."
+            )
+        return zone
+
+    @staticmethod
+    def _slugify(value: str) -> str:
+        slug = re.sub(r"[^a-z0-9]+", "-", value.casefold()).strip("-")
+        return slug or "zone"
 
     @staticmethod
     def _validate_report_date(value: str) -> str:
