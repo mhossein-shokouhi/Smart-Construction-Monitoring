@@ -228,8 +228,9 @@ Optional voice settings:
 | `OPENAI_SEARCH_VLM_MODEL` | `gpt-5.5` | Vision-capable model used by the laptop-side Search scanner |
 | `OPENAI_SEARCH_VLM_DETAIL` | `high` | Image detail sent to the Search VLM (`low`, `high`, or `auto`) |
 | `SEARCH_MATCH_THRESHOLD` | `0.75` | Minimum VLM confidence required before the dashboard raises a Search match alert |
-| `OPENAI_SAFETY_VLM_MODEL` | Search model value | Vision-capable model used by the Safety scanner |
-| `OPENAI_SAFETY_VLM_DETAIL` | Search detail value | Image detail sent to the Safety VLM (`low`, `high`, or `auto`) |
+| `OPENAI_SAFETY_VLM_MODEL` | `gpt-5.6-sol` | Frontier vision-capable model used by the Safety scanner |
+| `OPENAI_SAFETY_VLM_DETAIL` | `auto` | Image detail sent to the Safety VLM (`low`, `high`, `auto`, or `original`); GPT-5.6 preserves the source dimensions for `auto`/`original` |
+| `OPENAI_SAFETY_REASONING_EFFORT` | `medium` | Reasoning effort for each Safety assessment; `medium` is the balanced default for proximity judgment and alert latency |
 | `SAFETY_MATCH_THRESHOLD` | `0.75` | Minimum confidence required before a Safety hazard is latched and displayed |
 | `SAFETY_SITE_TIMEZONE` | `America/Vancouver` | IANA site timezone used for the after-hours access rule |
 | `SAFETY_ACCESS_START_HOUR` | `9` | First permitted construction-hour clock hour, inclusive |
@@ -296,16 +297,22 @@ exactly two applicable safety checks together. During configured construction
 hours, each frame is assessed for:
 
 - **Fire Hazard** — visible flame, fire, or smoke.
-- **Work-Zone Intrusion** — a person, animal, or other living creature
-  visibly present in an active machinery work zone.
+- **Work-Zone Intrusion** — a white or predominantly light-colored leveling
+  machine is recognizable, and a person is visibly close enough to share its
+  immediate working space or likely path of movement. The assessment uses
+  practical scene perspective rather than an exact distance. It excludes a
+  person clearly far away or only in the background and the normal operator
+  properly seated at the machine.
 
 Outside the configured 09:00–17:00 site-local window, the laptop performs a
 local clock check. Machinery is considered off, so **Work-Zone Intrusion** is
 replaced by **Unauthorized Entry**, which checks for a person present at the
 site. **Fire Hazard** remains active at all times. This decision is made
 in-process before the VLM request, so every frame still uses one model call.
-The full camera view is treated as the monitored work zone/site in the current
-demo.
+The working-hours rule uses the person's visible relationship to the leveling
+machine rather than treating any person anywhere in the camera view as an
+intrusion. The after-hours rule continues to treat the full view as the
+monitored site.
 
 A single frame can trigger multiple hazards. Each positive assessment above the
 configured confidence threshold produces a red **STOP WORK** alert with its

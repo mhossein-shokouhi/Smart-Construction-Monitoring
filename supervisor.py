@@ -43,8 +43,9 @@ SEARCH_MATCH_THRESHOLD = float(
         os.environ.get("EMERGENCY_MATCH_THRESHOLD", "0.75"),
     )
 )
-SAFETY_VLM_MODEL = os.environ.get("OPENAI_SAFETY_VLM_MODEL", SEARCH_VLM_MODEL)
-SAFETY_VLM_DETAIL = os.environ.get("OPENAI_SAFETY_VLM_DETAIL", SEARCH_VLM_DETAIL)
+SAFETY_VLM_MODEL = os.environ.get("OPENAI_SAFETY_VLM_MODEL", "gpt-5.6-sol")
+SAFETY_VLM_DETAIL = os.environ.get("OPENAI_SAFETY_VLM_DETAIL", "auto")
+SAFETY_REASONING_EFFORT = os.environ.get("OPENAI_SAFETY_REASONING_EFFORT", "medium")
 SAFETY_MATCH_THRESHOLD = float(os.environ.get("SAFETY_MATCH_THRESHOLD", "0.75"))
 SAFETY_SITE_TIMEZONE = os.environ.get("SAFETY_SITE_TIMEZONE", "America/Vancouver")
 SAFETY_ACCESS_START_HOUR = int(os.environ.get("SAFETY_ACCESS_START_HOUR", "9"))
@@ -138,6 +139,7 @@ safety_scanners = {
         receiver_url=STREAM_RECEIVER_URL,
         model=SAFETY_VLM_MODEL,
         image_detail=SAFETY_VLM_DETAIL,
+        reasoning_effort=SAFETY_REASONING_EFFORT,
         match_threshold=SAFETY_MATCH_THRESHOLD,
         max_workers=max(1, min(4, len(camera_ids))),
         site_timezone=SAFETY_SITE_TIMEZONE,
@@ -963,7 +965,11 @@ Behaviour rules:
   processing mode and evaluates each
   sampled frame once against exactly two applicable checks. During the configured
   09:00-17:00 site-local construction window, those checks are `Fire Hazard`
-  and `Work-Zone Intrusion`. Outside that window, machinery is considered off,
+  and `Work-Zone Intrusion`. Work-Zone Intrusion requires a recognizable white
+  or light-colored leveling machine and a person close enough to share its immediate
+  working space or likely path of movement. It excludes someone clearly distant or
+  only in the background and the normal operator properly seated at the machine.
+  Outside that window, machinery is considered off,
   so the checks are `Fire Hazard` and `Unauthorized Entry`. A frame can
   trigger more than one hazard. Safety alerts are red, include a visible
   STOP WORK message and cause, and latch the construction safety state red.

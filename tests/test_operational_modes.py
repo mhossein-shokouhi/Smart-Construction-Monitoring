@@ -674,6 +674,12 @@ class SafetyScannerTests(unittest.TestCase):
         self.assertIn("Fire Hazard", prompt)
         self.assertIn("Work-Zone Intrusion", prompt)
         self.assertNotIn("Unauthorized Entry", prompt)
+        self.assertIn("white or predominantly light-colored leveling", prompt)
+        self.assertIn("immediate working space", prompt)
+        self.assertIn("properly seated", prompt)
+        self.assertIn("do not demand exact geometric boundaries", prompt)
+        self.assertEqual(request["input"][0]["content"][1]["detail"], "auto")
+        self.assertEqual(request["reasoning"], {"effort": "medium"})
         self.assertEqual(
             schema["properties"]["assessments"]["required"],
             ["fire_smoke", "work_zone_encroachment"],
@@ -727,7 +733,31 @@ class SafetyScannerTests(unittest.TestCase):
         self.assertEqual(scanner.client.responses.create_count, 1)
         self.assertIn("Unauthorized Entry", prompt)
         self.assertNotIn("Work-Zone Intrusion", prompt)
+        self.assertNotIn("leveling or grading machine", prompt)
+        self.assertNotIn("immediate operating area", prompt)
         self.assertEqual(required, ["fire_smoke", "after_hours_intrusion"])
+
+    def test_safety_reasoning_effort_is_configurable_and_validated(self):
+        scanner = SafetyScanner(
+            client=FakeClient(
+                '{"assessments":{"fire_smoke":{"detected":false,"confidence":0.0,"cause":""}}}'
+            ),
+            receiver_url="http://receiver.test",
+            model="gpt-5.6-sol",
+            reasoning_effort="none",
+        )
+
+        scanner._analyze_frame(hazard_keys=("fire_smoke",), frame_bytes=b"jpeg")
+
+        self.assertEqual(scanner.client.responses.last_request["model"], "gpt-5.6-sol")
+        self.assertEqual(scanner.client.responses.last_request["reasoning"], {"effort": "none"})
+        with self.assertRaisesRegex(ValueError, "reasoning effort"):
+            SafetyScanner(
+                client=FakeClient(),
+                receiver_url="http://receiver.test",
+                model="gpt-5.6-sol",
+                reasoning_effort="turbo",
+            )
 
     def test_stopped_safety_scan_cannot_publish_stale_hazard(self):
         scanner = self._scanner(

@@ -5,15 +5,15 @@
       "name": "Camera 0",
       "location": "Front Gate",
       "zone": "Zone 0",
-      "pi_host": "128.189.192.173",
+      "pi_host": "172.20.10.6",
       "pi_port": 8000
     },
     {
       "id": 1,
       "name": "Camera 1",
       "location": "Warehouse",
-      "zone": "Zone 1",
-      "pi_host": "172.20.10.6",
+      "zone": "Zone 0",
+      "pi_host": "172.20.10.5",
       "pi_port": 8000
     },
     {
@@ -21,7 +21,7 @@
       "name": "Camera 2",
       "location": "Pump Station",
       "zone": "Zone 2",
-      "pi_host": "172.20.10.5",
+      "pi_host": "172.20.10.8",
       "pi_port": 8000
     },
     {

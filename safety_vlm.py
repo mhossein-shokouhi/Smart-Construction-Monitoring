@@ -25,9 +25,15 @@ SAFETY_HAZARDS: dict[str, dict[str, str]] = {
     "work_zone_encroachment": {
         "name": "Work-Zone Intrusion",
         "description": (
-            "A person, animal, or other living creature is visibly present inside the active "
-            "machinery work zone during construction hours. The camera view is the monitored "
-            "machinery zone; do not count plants or an image of a living thing on a sign or screen."
+            "A white or predominantly light-colored leveling or grading machine is recognizable "
+            "in the frame, allowing for ordinary dirt, shadow, or a partial view, and a person is "
+            "visibly close enough to share the machine's immediate working space or likely path of "
+            "movement. Treat a person directly in front of the machine, beside its active working "
+            "area, or otherwise near enough for a plausible contact or struck-by risk as an "
+            "intrusion. Do not require an exact measured distance, proof that the machine is moving, "
+            "or one precise body position. Do not trigger for someone clearly far away or only in "
+            "the background, or for the normal operator properly seated on the machine or at its "
+            "normal rear operating position."
         ),
     },
     "after_hours_intrusion": {
@@ -50,7 +56,8 @@ class SafetyScanner(SearchScanner):
         client,
         receiver_url: str,
         model: str,
-        image_detail: str = "high",
+        image_detail: str = "auto",
+        reasoning_effort: str = "medium",
         sample_interval_sec: float = 1.0,
         match_threshold: float = 0.75,
         alert_cooldown_sec: float = 15.0,
@@ -78,7 +85,10 @@ class SafetyScanner(SearchScanner):
             raise ValueError("Safety access hours must be integers from 0 through 23.")
         if access_start_hour == access_end_hour:
             raise ValueError("Safety access start and end hours must differ.")
+        if reasoning_effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
+            raise ValueError("Unsupported Safety VLM reasoning effort.")
 
+        self.reasoning_effort = reasoning_effort
         self.site_timezone_name = site_timezone
         self.site_timezone = ZoneInfo(site_timezone)
         self.access_start_hour = access_start_hour
@@ -190,11 +200,23 @@ class SafetyScanner(SearchScanner):
             f'- {key} ({SAFETY_HAZARDS[key]["name"]}): {SAFETY_HAZARDS[key]["description"]}'
             for key in hazard_keys
         ]
+        work_zone_guidance = ""
+        if "work_zone_encroachment" in hazard_keys:
+            work_zone_guidance = (
+                " For Work-Zone Intrusion, use practical scene-level judgment about proximity. "
+                "Account for camera perspective, relative scale, overlap, and apparent ground "
+                "position. Favor detection when a reasonable observer would consider the person "
+                "inside the machine's immediate operating area; do not demand exact geometric "
+                "boundaries."
+            )
         prompt = (
             "You are the visual safety monitor for a construction-site camera system. "
             "Evaluate this single frame independently against every hazard check listed below. "
             "One frame may contain multiple hazards, so never stop after the first positive. "
             "Use only visible evidence in the image; if evidence is ambiguous, set detected=false. "
+            "A positive assessment must satisfy the applicable hazard description as a whole."
+            + work_zone_guidance
+            + " "
             "For each positive assessment, give a concise cause that states exactly what is visible. "
             "For each negative assessment, use an empty cause. The application—not you—handles "
             "time rules and alert latching.\n\nApplicable checks:\n"
@@ -223,6 +245,7 @@ class SafetyScanner(SearchScanner):
                     "schema": self._response_schema(hazard_keys),
                 }
             },
+            reasoning={"effort": self.reasoning_effort},
         )
         return self._parse_model_json(getattr(response, "output_text", "") or "")
 
