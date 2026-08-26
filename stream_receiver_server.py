@@ -707,6 +707,80 @@ INDEX_HTML = r"""<!DOCTYPE html>
       border-radius: 50%;
       background: currentColor;
     }
+    .alarm-audio-button {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 38px;
+      margin-left: auto;
+      padding: 0 14px;
+      border: 1px solid rgba(255, 209, 102, 0.35);
+      border-radius: 8px;
+      background: rgba(255, 209, 102, 0.1);
+      color: #ffd166;
+      font: inherit;
+      font-size: 0.8125rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .alarm-audio-button .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+    .alarm-audio-button.armed {
+      border-color: rgba(52, 211, 153, 0.35);
+      background: rgba(16, 185, 129, 0.12);
+      color: #67e8a5;
+    }
+    .alarm-audio-button.pending {
+      border-color: rgba(248, 113, 113, 0.72);
+      background: rgba(127, 29, 29, 0.38);
+      color: #fecaca;
+    }
+    .global-safety-banner {
+      width: 100%;
+      max-width: 1200px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 18px;
+      padding: 14px 16px;
+      border: 1px solid rgba(248, 113, 113, 0.8);
+      border-radius: 10px;
+      background: linear-gradient(135deg, rgba(153, 27, 27, 0.92), rgba(69, 10, 10, 0.9));
+      box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.2), 0 12px 34px rgba(127, 29, 29, 0.34);
+    }
+    .global-safety-banner[hidden] {
+      display: none;
+    }
+    .global-safety-title {
+      color: #fff;
+      font-size: 1rem;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+    }
+    .global-safety-detail {
+      margin-top: 3px;
+      color: #fecaca;
+      font-size: 0.8125rem;
+      line-height: 1.35;
+    }
+    .global-safety-action {
+      flex-shrink: 0;
+      min-height: 34px;
+      padding: 0 12px;
+      border: 1px solid rgba(255,255,255,0.42);
+      border-radius: 7px;
+      background: rgba(255,255,255,0.1);
+      color: #fff;
+      font: inherit;
+      font-size: 0.75rem;
+      font-weight: 700;
+      cursor: pointer;
+    }
     .tab-view {
       display: none;
       width: 100%;
@@ -1507,6 +1581,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
     }
     @media (max-width: 620px) {
       body { padding: 16px; }
+      .view-tabs { flex-wrap: wrap; }
+      .alarm-audio-button { width: 100%; margin-left: 0; justify-content: center; }
+      .global-safety-banner { align-items: stretch; flex-direction: column; }
+      .global-safety-action { width: 100%; }
     }
   </style>
 </head>
@@ -1538,7 +1616,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <span class="view-tab-dot"></span>
       <span>System Logs</span>
     </button>
+    <button type="button" class="alarm-audio-button" id="alarm-audio-button" aria-pressed="false" title="Enable dashboard alert sounds">
+      <span class="dot"></span>
+      <span id="alarm-audio-label">Enable alert sound</span>
+    </button>
   </nav>
+  <div class="global-safety-banner" id="global-safety-banner" role="alert" aria-live="assertive" hidden>
+    <div>
+      <div class="global-safety-title">STOP WORK — Safety hazard active</div>
+      <div class="global-safety-detail" id="global-safety-detail">Operator clearance required.</div>
+    </div>
+    <button type="button" class="global-safety-action" id="global-safety-action">View safety details</button>
+  </div>
   <section class="tab-view active" id="live-view">
   <div class="layout" id="single-camera-layout">
     <div class="stream-box">
@@ -1657,8 +1746,15 @@ INDEX_HTML = r"""<!DOCTYPE html>
       const systemSafetyDetail = document.getElementById('system-safety-detail');
       const zoneStateGrid = document.getElementById('zone-state-grid');
       const systemLogList = document.getElementById('system-log-list');
+      const globalSafetyBanner = document.getElementById('global-safety-banner');
+      const globalSafetyDetail = document.getElementById('global-safety-detail');
+      const alarmAudioButton = document.getElementById('alarm-audio-button');
+      const alarmAudioLabel = document.getElementById('alarm-audio-label');
+      const dashboardStartedAt = Date.now() / 1000;
       let systemLogInitialized = false;
       let lastAlertEventId = 0;
+      let lastSoundedAlertEventId = 0;
+      let pendingAlarmEventId = 0;
       let alarmContext = null;
 
       function setView(view) {
@@ -1674,34 +1770,76 @@ INDEX_HTML = r"""<!DOCTYPE html>
         tab.addEventListener('click', () => setView(tab.dataset.view));
       });
 
-      function prepareAlarmAudio() {
-        const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
-        if (!AudioContextCtor) return null;
-        if (!alarmContext) alarmContext = new AudioContextCtor();
-        if (alarmContext.state === 'suspended') alarmContext.resume().catch(() => {});
-        return alarmContext;
+      function updateAlarmAudioStatus() {
+        const armed = Boolean(alarmContext && alarmContext.state === 'running');
+        const pending = pendingAlarmEventId > lastSoundedAlertEventId;
+        alarmAudioButton.classList.toggle('armed', armed);
+        alarmAudioButton.classList.toggle('pending', pending && !armed);
+        alarmAudioButton.setAttribute('aria-pressed', armed ? 'true' : 'false');
+        alarmAudioLabel.textContent = armed
+          ? 'Alert sound on'
+          : (pending ? 'Enable sound — alert pending' : 'Enable alert sound');
       }
 
-      document.addEventListener('pointerdown', prepareAlarmAudio, { once: true });
-
-      function playAlarm() {
-        const ctx = prepareAlarmAudio();
-        if (!ctx) return;
-        const now = ctx.currentTime;
+      function playPendingAlarm() {
+        if (pendingAlarmEventId <= lastSoundedAlertEventId) return true;
+        if (!alarmContext || alarmContext.state !== 'running') {
+          updateAlarmAudioStatus();
+          return false;
+        }
+        const eventId = pendingAlarmEventId;
+        const now = alarmContext.currentTime;
         [0, 0.22, 0.44].forEach((offset) => {
-          const osc = ctx.createOscillator();
-          const gain = ctx.createGain();
+          const osc = alarmContext.createOscillator();
+          const gain = alarmContext.createGain();
           osc.type = 'square';
           osc.frequency.setValueAtTime(880, now + offset);
           gain.gain.setValueAtTime(0.0001, now + offset);
           gain.gain.exponentialRampToValueAtTime(0.13, now + offset + 0.02);
           gain.gain.exponentialRampToValueAtTime(0.0001, now + offset + 0.16);
           osc.connect(gain);
-          gain.connect(ctx.destination);
+          gain.connect(alarmContext.destination);
           osc.start(now + offset);
           osc.stop(now + offset + 0.18);
         });
+        lastSoundedAlertEventId = eventId;
+        if (pendingAlarmEventId <= lastSoundedAlertEventId) pendingAlarmEventId = 0;
+        updateAlarmAudioStatus();
+        return true;
       }
+
+      async function prepareAlarmAudio() {
+        const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContextCtor) {
+          alarmAudioLabel.textContent = 'Alert sound unavailable';
+          alarmAudioButton.disabled = true;
+          return false;
+        }
+        if (!alarmContext || alarmContext.state === 'closed') {
+          alarmContext = new AudioContextCtor();
+          alarmContext.addEventListener('statechange', updateAlarmAudioStatus);
+        }
+        try {
+          if (alarmContext.state !== 'running') await alarmContext.resume();
+        } catch (_) {
+          updateAlarmAudioStatus();
+          return false;
+        }
+        updateAlarmAudioStatus();
+        if (alarmContext.state === 'running') playPendingAlarm();
+        return alarmContext.state === 'running';
+      }
+
+      function unlockAlarmAudio() {
+        void prepareAlarmAudio();
+      }
+
+      document.addEventListener('pointerdown', unlockAlarmAudio, { passive: true });
+      document.addEventListener('keydown', (event) => {
+        if (!event.repeat) unlockAlarmAudio();
+      });
+      alarmAudioButton.addEventListener('click', unlockAlarmAudio);
+      document.getElementById('global-safety-action').addEventListener('click', () => setView('system'));
 
       function parseUrlSelection() {
         if (window.location.hash === '#view=grid' || window.location.hash === '#grid') {
@@ -2231,14 +2369,19 @@ INDEX_HTML = r"""<!DOCTYPE html>
             systemOverview.classList.toggle('hazard', safetyHazard);
             systemSafetyValue.textContent = safetyHazard ? 'STOP WORK — Hazard active' : 'Clear for construction';
             systemSafetyValue.className = 'value ' + (safetyHazard ? 'safety-hazard' : 'safety-clear');
+            globalSafetyBanner.hidden = !safetyHazard;
             if (safetyHazard && activeHazards.length) {
               const names = [...new Set(activeHazards.map(item => item.hazard_name).filter(Boolean))];
-              systemSafetyDetail.textContent = names.join(' · ') || 'Operator clearance required.';
+              const detail = names.join(' · ') || 'Operator clearance required.';
+              systemSafetyDetail.textContent = detail;
+              globalSafetyDetail.textContent = detail + ' — Operator clearance required.';
             } else {
               systemSafetyDetail.textContent = safetyHazard
                 ? 'Operator clearance required.'
                 : 'No active safety hazards.';
+              globalSafetyDetail.textContent = 'Operator clearance required.';
             }
+            document.title = safetyHazard ? 'STOP WORK — Operations center' : 'Camera stream';
 
             const zoneStates = Array.isArray(state.zones) ? state.zones : [];
             const hazardZones = new Set(activeHazards.map(item => item.zone).filter(Boolean));
@@ -2276,7 +2419,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
           .then(entries => {
             const alerts = entries.filter(entry => entry.kind === 'alert' || entry.kind === 'safety_alert');
             const newestAlertId = alerts.reduce((maxId, entry) => Math.max(maxId, entry.id || 0), 0);
-            if (systemLogInitialized && newestAlertId > lastAlertEventId) playAlarm();
+            const alertArrivedAfterDashboardLoad = !systemLogInitialized && alerts.some(
+              entry => Number(entry.time || 0) >= dashboardStartedAt
+            );
+            if ((systemLogInitialized && newestAlertId > lastAlertEventId) || alertArrivedAfterDashboardLoad) {
+              pendingAlarmEventId = Math.max(pendingAlarmEventId, newestAlertId);
+              playPendingAlarm();
+            }
             lastAlertEventId = Math.max(lastAlertEventId, newestAlertId);
             systemLogInitialized = true;
 
@@ -2301,6 +2450,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
         fetch('/system/log/clear', { method: 'POST' })
           .then(() => {
             lastAlertEventId = 0;
+            lastSoundedAlertEventId = 0;
+            pendingAlarmEventId = 0;
+            updateAlarmAudioStatus();
             systemLogInitialized = false;
             refreshSystemLog();
           })
