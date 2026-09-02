@@ -7,7 +7,6 @@ import html
 import json
 import os
 import re
-import tempfile
 import threading
 import time
 import unicodedata
@@ -19,6 +18,10 @@ from typing import Any, Callable, Optional
 from zoneinfo import ZoneInfo
 
 import requests
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_REPORTING_SNAPSHOT_ROOT = PROJECT_ROOT / "data" / "reporting_snapshots"
 
 
 @dataclass(frozen=True)
@@ -101,8 +104,7 @@ class ConstructionReporting:
         self.max_analysis_workers = max(1, max_analysis_workers)
         self.max_frames_per_camera = int(max_frames_per_camera)
         self.snapshot_root = Path(
-            snapshot_root
-            or Path(tempfile.gettempdir()) / "rogers-scp-reporting-snapshots"
+            snapshot_root or DEFAULT_REPORTING_SNAPSHOT_ROOT
         ).expanduser().resolve()
         self.output_dir = Path(
             output_dir or Path(__file__).resolve().parent / "output" / "pdf"
@@ -159,7 +161,8 @@ class ConstructionReporting:
                 level="info",
                 message=(
                     "Minute-by-minute reporting capture is active in "
-                    f"{self.site_timezone_name}."
+                    f"{self.site_timezone_name}. Snapshots are saved under "
+                    f"{self.snapshot_root}."
                 ),
             )
             while not stop_event.is_set():
@@ -278,6 +281,7 @@ class ConstructionReporting:
             "status": status,
             "date": report_date,
             "scheduled_time": f"{now.hour:02d}:{now.minute:02d}",
+            "snapshot_root": str(self.snapshot_root),
             "captured": captured,
             "already_present": already_present,
             "failed": failed,
@@ -308,7 +312,15 @@ class ConstructionReporting:
         hour: int,
         minute: int,
     ) -> tuple[Path, Path]:
-        camera_dir = self.snapshot_root / report_date / f"camera_{camera_id}"
+        camera = self.cameras.get(camera_id, {})
+        zone_name = str(camera.get("zone") or "Unassigned")
+        camera_name = str(camera.get("name") or f"Camera {camera_id}")
+        zone_dir = self._slugify(zone_name)
+        camera_slug = self._slugify(camera_name)
+        camera_dir_name = f"camera-{camera_id}"
+        if camera_slug not in {"camera", camera_dir_name}:
+            camera_dir_name += f"-{camera_slug}"
+        camera_dir = self.snapshot_root / report_date / zone_dir / camera_dir_name
         stem = f"{hour:02d}-{minute:02d}"
         return camera_dir / f"{stem}.jpg", camera_dir / f"{stem}.json"
 
@@ -339,7 +351,7 @@ class ConstructionReporting:
         snapshots: list[ReportingSnapshot] = []
         if not day_dir.is_dir():
             return snapshots
-        for metadata_path in sorted(day_dir.glob("camera_*/*.json")):
+        for metadata_path in sorted(day_dir.rglob("*.json")):
             image_path = metadata_path.with_suffix(".jpg")
             if not image_path.is_file():
                 continue
@@ -432,6 +444,7 @@ class ConstructionReporting:
             "zone": clean_zone,
             "recorder_running": self.is_running(),
             "site_timezone": self.site_timezone_name,
+            "snapshot_root": str(self.snapshot_root),
             "expected_minute_count": len(expected_times),
             "snapshot_count": len(snapshots),
             "camera_coverage": camera_coverage,

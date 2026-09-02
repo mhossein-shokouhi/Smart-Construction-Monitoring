@@ -569,7 +569,8 @@ def _set_operational_mode_locked(
         )
         message = (
             f"Safety Mode activated for {zone_text}. From {hours}, the selected zone cameras "
-            "are checked for Fire Hazard and Work-Zone Intrusion; outside that window they "
+            "are checked for Fire Hazard, Work-Zone Intrusion, and Obstacle Hazard. Obstacle "
+            "detections are shown as silent dashboard warnings; outside that window the cameras "
             "are checked for Fire Hazard and Unauthorized Entry."
         )
     elif clean_mode == "investigation":
@@ -963,16 +964,25 @@ Behaviour rules:
 - Safety Mode is the implemented continuous construction-safety workflow for
   the selected zone. It keeps that zone's reachable cameras in `default`
   processing mode and evaluates each
-  sampled frame once against exactly two applicable checks. During the configured
-  09:00-17:00 site-local construction window, those checks are `Fire Hazard`
-  and `Work-Zone Intrusion`. Work-Zone Intrusion requires a recognizable white
-  or light-colored leveling machine and a person close enough to share its immediate
-  working space or likely path of movement. It excludes someone clearly distant or
-  only in the background and the normal operator properly seated at the machine.
+  sampled frame once against every applicable check. During the configured
+  09:00-17:00 site-local construction window, those checks are `Fire Hazard`,
+  `Work-Zone Intrusion`, and `Obstacle Hazard`. Work-Zone Intrusion requires a
+  recognizable white or light-colored leveling machine and a person close enough
+  to share its immediate working space or likely path of movement. It excludes
+  someone clearly distant or only in the background and the normal operator
+  properly seated at the machine.
+  Obstacle Hazard requires that same recognizable machine plus a substantial obstacle,
+  such as a traffic cone or a large green, blue, or white pipe on the ground, visibly
+  close to the machine or directly in its apparent travel or working path. Do not treat
+  an object elsewhere in the frame, ordinary terrain, markings, shadows, small debris,
+  or machine parts as an Obstacle Hazard.
   Outside that window, machinery is considered off,
   so the checks are `Fire Hazard` and `Unauthorized Entry`. A frame can
-  trigger more than one hazard. Safety alerts are red, include a visible
-  STOP WORK message and cause, and latch the construction safety state red.
+  trigger more than one detection. An Obstacle Hazard result is presented as a
+  yellow/orange, silent dashboard warning and is recorded with its cause and
+  triggering frame; it does not latch the construction safety state. `Fire
+  Hazard`, `Work-Zone Intrusion`, and `Unauthorized Entry` remain audible red
+  STOP WORK alerts that latch the construction safety state red.
 - A latched hazard survives operational-mode changes.
   Call `clear_safety_hazard` only when the operator explicitly asks to clear,
   reset, or acknowledge the safety state. Never clear it merely because the
@@ -992,7 +1002,10 @@ Behaviour rules:
 - Progress reporting is not an operational mode and never interrupts the active
   operational mode. A passive recorder saves one fresh frame per registered
   camera during every clock minute, all day, in {REPORTING_SITE_TIMEZONE}. Use
-  `get_reporting_status` when asked what recent evidence is available.
+  `get_reporting_status` when asked what recent evidence is available. The
+  snapshots persist under {reporting_service.snapshot_root}, organized by date,
+  zone, camera, and minute; state this path when the operator asks where the
+  captured evidence is stored.
 - Use `generate_progress_report` when the operator asks for a construction
   report covering a recent duration. A zone and duration are required. Convert
   spoken durations to whole minutes: five minutes is 5, two hours is 120, and

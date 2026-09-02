@@ -36,6 +36,24 @@ SAFETY_HAZARDS: dict[str, dict[str, str]] = {
             "normal rear operating position."
         ),
     },
+    "machine_obstacle_proximity": {
+        "name": "Obstacle Hazard",
+        "description": (
+            "A white or predominantly light-colored leveling or grading machine is recognizable "
+            "in the frame, allowing for ordinary dirt, shadow, or a partial view, and a substantial "
+            "ground obstacle is visibly close to the machine or directly in its apparent near-term "
+            "travel or working path. The placement must create a plausible contact, collision, or "
+            "equipment-damage risk if operation continues. Typical obstacles include traffic cones "
+            "and large or wide rigid pipe or conduit sections lying on or crossing the ground, "
+            "including green, blue, or white pipes, as well as similarly substantial freestanding "
+            "objects. Require both the machine and obstacle plus a clear risky spatial relationship. "
+            "Do not trigger merely because an obstacle appears somewhere in the same frame, when it "
+            "is clearly distant, outside the machine's apparent path, or safely separated. Do not "
+            "misclassify machine parts or attachments, painted markings, shadows, narrow hoses or "
+            "cables, small debris, or ordinary soil texture as this hazard. Do not require proof that "
+            "the machine is moving or an exact measured distance in a single frame."
+        ),
+    },
     "after_hours_intrusion": {
         "name": "Unauthorized Entry",
         "description": (
@@ -130,6 +148,7 @@ class SafetyScanner(SearchScanner):
             keys.append("after_hours_intrusion")
         else:
             keys.append("work_zone_encroachment")
+            keys.append("machine_obstacle_proximity")
         return tuple(keys)
 
     def _scan_camera_once(self, camera_id: int, generation: int, _target: str) -> None:
@@ -200,14 +219,25 @@ class SafetyScanner(SearchScanner):
             f'- {key} ({SAFETY_HAZARDS[key]["name"]}): {SAFETY_HAZARDS[key]["description"]}'
             for key in hazard_keys
         ]
-        work_zone_guidance = ""
+        proximity_guidance = ""
         if "work_zone_encroachment" in hazard_keys:
-            work_zone_guidance = (
+            proximity_guidance += (
                 " For Work-Zone Intrusion, use practical scene-level judgment about proximity. "
                 "Account for camera perspective, relative scale, overlap, and apparent ground "
                 "position. Favor detection when a reasonable observer would consider the person "
                 "inside the machine's immediate operating area; do not demand exact geometric "
                 "boundaries."
+            )
+        if "machine_obstacle_proximity" in hazard_keys:
+            proximity_guidance += (
+                " For Obstacle Hazard, judge the machine and obstacle as a pair using perspective, "
+                "relative scale, overlap, apparent ground position, and the machine's visible "
+                "orientation or working area. Detect when a traffic cone, wide rigid pipe, or "
+                "similarly substantial object is close enough or placed directly enough in the "
+                "apparent path that continued operation could reasonably contact it. Object type "
+                "or color alone is not sufficient, and mere co-occurrence in the frame is negative. "
+                "If the object is ambiguous, clearly distant, off-path, or part of the machine, set "
+                "detected=false."
             )
         prompt = (
             "You are the visual safety monitor for a construction-site camera system. "
@@ -215,7 +245,7 @@ class SafetyScanner(SearchScanner):
             "One frame may contain multiple hazards, so never stop after the first positive. "
             "Use only visible evidence in the image; if evidence is ambiguous, set detected=false. "
             "A positive assessment must satisfy the applicable hazard description as a whole."
-            + work_zone_guidance
+            + proximity_guidance
             + " "
             "For each positive assessment, give a concise cause that states exactly what is visible. "
             "For each negative assessment, use an empty cause. The application—not you—handles "

@@ -133,6 +133,18 @@ class ReportingTests(unittest.TestCase):
             max_frames_per_camera=max_frames_per_camera,
         )
 
+    def test_default_snapshot_root_is_persistent_and_repository_local(self):
+        service = ConstructionReporting(
+            client=FakeClient(),
+            receiver_url="http://receiver",
+            cameras={0: {"name": "Camera 0", "zone": "Zone 0"}},
+        )
+
+        self.assertEqual(
+            service.snapshot_root,
+            Path(reporting.__file__).resolve().parent / "data" / "reporting_snapshots",
+        )
+
     def test_minute_capture_saves_once_per_camera_then_advances_next_minute(self):
         current = datetime(2026, 8, 18, 9, 12, 3, tzinfo=ZoneInfo("America/Vancouver"))
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -154,6 +166,20 @@ class ReportingTests(unittest.TestCase):
             self.assertTrue(all(item.slot_hour == 9 for item in snapshots))
             self.assertEqual({item.slot_minute for item in snapshots}, {12, 13})
             self.assertTrue(all(item.image_path.read_bytes() == b"jpeg-bytes" for item in snapshots))
+            relative_paths = {
+                item.image_path.relative_to(service.snapshot_root).as_posix()
+                for item in snapshots
+            }
+            self.assertEqual(
+                relative_paths,
+                {
+                    "2026-08-18/zone-a/camera-0-north-camera/09-12.jpg",
+                    "2026-08-18/zone-a/camera-0-north-camera/09-13.jpg",
+                    "2026-08-18/zone-a/camera-1-south-camera/09-12.jpg",
+                    "2026-08-18/zone-a/camera-1-south-camera/09-13.jpg",
+                },
+            )
+            self.assertEqual(first["snapshot_root"], str(service.snapshot_root))
 
     def test_capture_rejects_stale_frames_and_retries_same_minute(self):
         current = datetime(2026, 8, 18, 10, 15, tzinfo=ZoneInfo("America/Vancouver"))

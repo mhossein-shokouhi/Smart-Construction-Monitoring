@@ -22,3 +22,5 @@ SMB_connect_command.txt
 # Runtime artifacts
 *.log
 output/pdf/*.pdf
+data/reporting_snapshots/*
+!data/reporting_snapshots/README.md

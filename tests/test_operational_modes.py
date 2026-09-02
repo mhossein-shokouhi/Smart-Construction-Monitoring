@@ -350,7 +350,10 @@ class OperationalModeTests(unittest.TestCase):
         self.assertIn("Never\n  change an unmentioned zone", supervisor.SYSTEM_PROMPT)
         self.assertIn("Fire Hazard", supervisor.SYSTEM_PROMPT)
         self.assertIn("Work-Zone Intrusion", supervisor.SYSTEM_PROMPT)
+        self.assertIn("Obstacle Hazard", supervisor.SYSTEM_PROMPT)
         self.assertIn("Unauthorized Entry", supervisor.SYSTEM_PROMPT)
+        self.assertIn("silent dashboard warning", supervisor.SYSTEM_PROMPT)
+        self.assertIn("remain audible red", supervisor.SYSTEM_PROMPT)
         self.assertIn("only when the operator explicitly asks", supervisor.SYSTEM_PROMPT)
         self.assertIn(".sup-mode-chip.hazard", supervisor.SUPERVISOR_CSS)
         self.assertIn('"Stop work · " + modeLabel', supervisor.SUPERVISOR_JS)
@@ -640,22 +643,23 @@ class SafetyScannerTests(unittest.TestCase):
         )
         self.assertEqual(
             scanner.active_hazard_keys(datetime(2026, 8, 17, 9, 0, tzinfo=self.timezone)),
-            ("fire_smoke", "work_zone_encroachment"),
+            ("fire_smoke", "work_zone_encroachment", "machine_obstacle_proximity"),
         )
         self.assertEqual(
             scanner.active_hazard_keys(datetime(2026, 8, 17, 16, 59, tzinfo=self.timezone)),
-            ("fire_smoke", "work_zone_encroachment"),
+            ("fire_smoke", "work_zone_encroachment", "machine_obstacle_proximity"),
         )
         self.assertEqual(
             scanner.active_hazard_keys(datetime(2026, 8, 17, 17, 0, tzinfo=self.timezone)),
             ("fire_smoke", "after_hours_intrusion"),
         )
 
-    def test_daytime_frame_uses_one_structured_call_for_two_hazards(self):
+    def test_daytime_frame_uses_one_structured_call_for_three_hazards(self):
         output = (
             '{"assessments":{'
             '"fire_smoke":{"detected":false,"confidence":0.05,"cause":""},'
-            '"work_zone_encroachment":{"detected":false,"confidence":0.1,"cause":""}'
+            '"work_zone_encroachment":{"detected":false,"confidence":0.1,"cause":""},'
+            '"machine_obstacle_proximity":{"detected":false,"confidence":0.08,"cause":""}'
             '}}'
         )
         scanner = self._scanner(
@@ -670,19 +674,27 @@ class SafetyScannerTests(unittest.TestCase):
         prompt = request["input"][0]["content"][0]["text"]
         schema = request["text"]["format"]["schema"]
         self.assertEqual(scanner.client.responses.create_count, 1)
-        self.assertEqual(set(result["assessments"]), {"fire_smoke", "work_zone_encroachment"})
+        self.assertEqual(
+            set(result["assessments"]),
+            {"fire_smoke", "work_zone_encroachment", "machine_obstacle_proximity"},
+        )
         self.assertIn("Fire Hazard", prompt)
         self.assertIn("Work-Zone Intrusion", prompt)
+        self.assertIn("Obstacle Hazard", prompt)
         self.assertNotIn("Unauthorized Entry", prompt)
         self.assertIn("white or predominantly light-colored leveling", prompt)
         self.assertIn("immediate working space", prompt)
         self.assertIn("properly seated", prompt)
         self.assertIn("do not demand exact geometric boundaries", prompt)
+        self.assertIn("traffic cones", prompt)
+        self.assertIn("green, blue, or white pipes", prompt)
+        self.assertIn("mere co-occurrence in the frame is negative", prompt)
+        self.assertIn("machine parts or attachments", prompt)
         self.assertEqual(request["input"][0]["content"][1]["detail"], "auto")
         self.assertEqual(request["reasoning"], {"effort": "medium"})
         self.assertEqual(
             schema["properties"]["assessments"]["required"],
-            ["fire_smoke", "work_zone_encroachment"],
+            ["fire_smoke", "work_zone_encroachment", "machine_obstacle_proximity"],
         )
         self.assertTrue(request["text"]["format"]["strict"])
 
@@ -690,7 +702,8 @@ class SafetyScannerTests(unittest.TestCase):
         output = (
             '{"assessments":{'
             '"fire_smoke":{"detected":true,"confidence":0.96,"cause":"Flames and dark smoke are visible."},'
-            '"work_zone_encroachment":{"detected":true,"confidence":0.91,"cause":"A person is inside the work zone."}'
+            '"work_zone_encroachment":{"detected":true,"confidence":0.91,"cause":"A person is inside the work zone."},'
+            '"machine_obstacle_proximity":{"detected":true,"confidence":0.94,"cause":"A wide green pipe is directly in front of the machine."}'
             '}}'
         )
         scanner = self._scanner(
@@ -706,11 +719,35 @@ class SafetyScannerTests(unittest.TestCase):
             scanner._scan_camera_once(2, scanner._generation, "ignored")
 
         self.assertEqual(scanner.client.responses.create_count, 1)
-        self.assertEqual(post_hazard.call_count, 2)
+        self.assertEqual(post_hazard.call_count, 3)
         self.assertEqual(
             {call.kwargs["hazard_key"] for call in post_hazard.call_args_list},
-            {"fire_smoke", "work_zone_encroachment"},
+            {"fire_smoke", "work_zone_encroachment", "machine_obstacle_proximity"},
         )
+
+    def test_low_confidence_obstacle_assessment_does_not_alert(self):
+        output = (
+            '{"assessments":{'
+            '"fire_smoke":{"detected":false,"confidence":0.0,"cause":""},'
+            '"work_zone_encroachment":{"detected":false,"confidence":0.0,"cause":""},'
+            '"machine_obstacle_proximity":{"detected":true,"confidence":0.7,'
+            '"cause":"A possible pipe may be near the machine."}'
+            '}}'
+        )
+        scanner = self._scanner(
+            output,
+            datetime(2026, 8, 17, 12, 0, tzinfo=self.timezone),
+        )
+
+        with patch.object(
+            scanner,
+            "_latest_frame",
+            return_value=(b"jpeg", 1.0),
+        ), patch.object(scanner, "_post_hazard") as post_hazard:
+            scanner._scan_camera_once(2, scanner._generation, "ignored")
+
+        self.assertEqual(scanner.client.responses.create_count, 1)
+        post_hazard.assert_not_called()
 
     def test_after_hours_frame_replaces_work_zone_check_with_unauthorized_entry(self):
         output = (
@@ -733,6 +770,7 @@ class SafetyScannerTests(unittest.TestCase):
         self.assertEqual(scanner.client.responses.create_count, 1)
         self.assertIn("Unauthorized Entry", prompt)
         self.assertNotIn("Work-Zone Intrusion", prompt)
+        self.assertNotIn("Obstacle Hazard", prompt)
         self.assertNotIn("leveling or grading machine", prompt)
         self.assertNotIn("immediate operating area", prompt)
         self.assertEqual(required, ["fire_smoke", "after_hours_intrusion"])
@@ -775,6 +813,11 @@ class SafetyScannerTests(unittest.TestCase):
                         "cause": "Flames are visible.",
                     },
                     "work_zone_encroachment": {
+                        "detected": False,
+                        "confidence": 0.0,
+                        "cause": "",
+                    },
+                    "machine_obstacle_proximity": {
                         "detected": False,
                         "confidence": 0.0,
                         "cause": "",
@@ -932,6 +975,7 @@ class ReceiverOperationalStateTests(unittest.TestCase):
         alert = self.client.get("/system/log").json()[-1]
         self.assertEqual(alert["kind"], "safety_alert")
         self.assertEqual(alert["level"], "critical")
+        self.assertTrue(alert["audible"])
         self.assertIn("STOP WORK", alert["message"])
         self.assertNotIn("stop_note", alert)
 
@@ -956,6 +1000,99 @@ class ReceiverOperationalStateTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(self.client.get("/system/state").json()["safety_status"], "clear")
+
+    def test_stop_work_hazard_types_remain_critical_audible_and_latched(self):
+        hazard_types = (
+            ("fire_smoke", "Fire Hazard"),
+            ("work_zone_encroachment", "Work-Zone Intrusion"),
+            ("after_hours_intrusion", "Unauthorized Entry"),
+        )
+
+        for hazard_key, hazard_name in hazard_types:
+            with self.subTest(hazard_key=hazard_key):
+                response = self.client.post(
+                    "/system/safety/hazard",
+                    json={
+                        "hazard_key": hazard_key,
+                        "camera_id": 0,
+                        "confidence": 0.94,
+                        "cause": "Visible evidence confirms this stop-work condition.",
+                    },
+                )
+
+                self.assertEqual(response.status_code, 200)
+                result = response.json()
+                event = result["event"]
+                self.assertEqual(event["hazard_name"], hazard_name)
+                self.assertEqual(event["kind"], "safety_alert")
+                self.assertEqual(event["level"], "critical")
+                self.assertTrue(event["audible"])
+                self.assertIn("STOP WORK", event["message"])
+                self.assertEqual(result["state"]["safety_status"], "hazard")
+                self.assertEqual(
+                    [item["hazard_key"] for item in result["state"]["active_safety_hazards"]],
+                    [hazard_key],
+                )
+                self.client.post("/system/safety/clear", json={"reason": "Test reset."})
+
+    def test_receiver_routes_obstacle_detection_as_silent_non_latching_warning(self):
+        response = self.client.post(
+            "/system/safety/hazard",
+            json={
+                "hazard_key": "machine_obstacle_proximity",
+                "camera_id": 0,
+                "confidence": 0.92,
+                "cause": "A wide blue pipe is directly in the machine's apparent path.",
+                "frame_jpeg_b64": "anBlZw==",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        result = response.json()
+        event = result["event"]
+        self.assertEqual(event["hazard_name"], "Obstacle Hazard")
+        self.assertEqual(event["kind"], "safety_warning")
+        self.assertEqual(event["level"], "warning")
+        self.assertFalse(event["audible"])
+        self.assertIn("WARNING", event["message"])
+        self.assertNotIn("STOP WORK", event["message"])
+        self.assertEqual(result["state"]["safety_status"], "clear")
+        self.assertEqual(result["state"]["active_safety_hazards"], [])
+        self.assertEqual(event["frame_url"], f"/system/alerts/{event['id']}.jpg")
+        frame = self.client.get(event["frame_url"])
+        self.assertEqual(frame.status_code, 200)
+        self.assertEqual(frame.content, b"jpeg")
+
+    def test_obstacle_warning_does_not_change_an_existing_stop_work_hazard(self):
+        hazard_response = self.client.post(
+            "/system/safety/hazard",
+            json={
+                "hazard_key": "work_zone_encroachment",
+                "camera_id": 0,
+                "confidence": 0.97,
+                "cause": "A person is in the machine's immediate working space.",
+            },
+        )
+        self.assertEqual(hazard_response.status_code, 200)
+
+        warning_response = self.client.post(
+            "/system/safety/hazard",
+            json={
+                "hazard_key": "machine_obstacle_proximity",
+                "camera_id": 0,
+                "confidence": 0.93,
+                "cause": "A traffic cone is directly in the machine's path.",
+            },
+        )
+
+        self.assertEqual(warning_response.status_code, 200)
+        result = warning_response.json()
+        self.assertEqual(result["event"]["kind"], "safety_warning")
+        self.assertEqual(result["state"]["safety_status"], "hazard")
+        self.assertEqual(
+            [item["hazard_key"] for item in result["state"]["active_safety_hazards"]],
+            ["work_zone_encroachment"],
+        )
 
     def test_receiver_rejects_unknown_operational_mode(self):
         response = self.client.post("/system/state", json={"mode": "emergency"})
@@ -983,12 +1120,19 @@ class ReceiverOperationalStateTests(unittest.TestCase):
         self.assertIn("Clear for construction", html)
         self.assertIn("STOP WORK", html)
         self.assertIn('id="global-safety-banner"', html)
+        self.assertIn('id="global-safety-warning-banner"', html)
         self.assertIn('id="alarm-audio-button"', html)
         self.assertIn("pendingAlarmEventId", html)
+        self.assertIn("lastWarningEventId", html)
         self.assertIn("lastSoundedAlertEventId", html)
         self.assertIn("dashboardStartedAt", html)
         self.assertIn("Safety hazard frame", html)
+        self.assertIn("Safety warning frame", html)
         self.assertIn("safety-alert", html)
+        self.assertIn("safety-warning", html)
+        self.assertIn("entry.kind === 'safety_warning'", html)
+        self.assertIn("entry.audible !== false", html)
+        self.assertIn("showSafetyWarning", html)
         self.assertIn("Search match frame", html)
         self.assertNotIn("Emergency intent", html)
         self.assertNotIn("value.emergency", html)

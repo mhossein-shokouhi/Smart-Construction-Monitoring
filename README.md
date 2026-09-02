@@ -231,7 +231,7 @@ Optional voice settings:
 | `OPENAI_SAFETY_VLM_MODEL` | `gpt-5.6-sol` | Frontier vision-capable model used by the Safety scanner |
 | `OPENAI_SAFETY_VLM_DETAIL` | `auto` | Image detail sent to the Safety VLM (`low`, `high`, `auto`, or `original`); GPT-5.6 preserves the source dimensions for `auto`/`original` |
 | `OPENAI_SAFETY_REASONING_EFFORT` | `medium` | Reasoning effort for each Safety assessment; `medium` is the balanced default for proximity judgment and alert latency |
-| `SAFETY_MATCH_THRESHOLD` | `0.75` | Minimum confidence required before a Safety hazard is latched and displayed |
+| `SAFETY_MATCH_THRESHOLD` | `0.75` | Minimum confidence required before a Safety detection is published; stop-work hazards latch, while obstacle warnings do not |
 | `SAFETY_SITE_TIMEZONE` | `America/Vancouver` | IANA site timezone used for the after-hours access rule |
 | `SAFETY_ACCESS_START_HOUR` | `9` | First permitted construction-hour clock hour, inclusive |
 | `SAFETY_ACCESS_END_HOUR` | `17` | End of permitted construction hours; this hour is after-hours |
@@ -243,7 +243,7 @@ Optional voice settings:
 | `REPORTING_MAX_FRAME_AGE_SEC` | `10` | Maximum age of a receiver frame accepted as evidence for the current minute |
 | `REPORTING_MAX_ANALYSIS_WORKERS` | `2` | Maximum camera timelines analyzed concurrently |
 | `REPORTING_MAX_FRAMES_PER_CAMERA` | `24` | Maximum uniformly sampled frames from each camera sent to the VLM for one report; all saved frames still count toward coverage |
-| `REPORTING_SNAPSHOT_DIR` | OS temporary directory | Optional directory for timestamped minute-by-minute JPEG evidence and metadata |
+| `REPORTING_SNAPSHOT_DIR` | `data/reporting_snapshots` | Optional override for the persistent, timestamped minute-by-minute JPEG evidence archive |
 | `REPORTING_OUTPUT_DIR` | `output/pdf` | Directory for generated interval PDF reports |
 | `STREAM_RECEIVER_URL` | `http://127.0.0.1:9000` | Receiver URL used by the supervisor to read active streams and publish system logs |
 | `OPERATIONAL_STATE_PUBLISH_INTERVAL_SEC` | `2.0` | How often the supervisor republishes operational state so the receiver can recover after a restart |
@@ -293,8 +293,8 @@ and plays an alarm sound in the browser. Search Mode and match indicators use
 neutral blue/teal styling instead of critical-state red.
 
 Safety Mode uses the same zone-filtered stream sampling foundation but evaluates
-exactly two applicable safety checks together. During configured construction
-hours, each frame is assessed for:
+all applicable safety checks together in one VLM request. During configured
+construction hours, each frame is assessed for:
 
 - **Fire Hazard** — visible flame, fire, or smoke.
 - **Work-Zone Intrusion** — a white or predominantly light-colored leveling
@@ -303,24 +303,42 @@ hours, each frame is assessed for:
   practical scene perspective rather than an exact distance. It excludes a
   person clearly far away or only in the background and the normal operator
   properly seated at the machine.
+- **Obstacle Hazard** — the same recognizable leveling machine is visibly close
+  to a substantial obstacle or has one directly in its apparent travel or
+  working path, creating a plausible contact risk if operation continues.
+  Examples include traffic cones and large or wide green, blue, or white pipe
+  sections on the ground. The check requires a risky machine–obstacle spatial
+  relationship; it excludes distant or off-path objects, machine parts,
+  markings, shadows, small debris, narrow hoses or cables, and ordinary soil
+  texture.
 
 Outside the configured 09:00–17:00 site-local window, the laptop performs a
-local clock check. Machinery is considered off, so **Work-Zone Intrusion** is
-replaced by **Unauthorized Entry**, which checks for a person present at the
-site. **Fire Hazard** remains active at all times. This decision is made
-in-process before the VLM request, so every frame still uses one model call.
+local clock check. Machinery is considered off, so **Work-Zone Intrusion** and
+**Obstacle Hazard** are replaced by **Unauthorized Entry**, which checks for a
+person present at the site. **Fire Hazard** remains active at all times. This
+decision is made in-process before the VLM request, so every frame still uses
+one model call.
 The working-hours rule uses the person's visible relationship to the leveling
 machine rather than treating any person anywhere in the camera view as an
 intrusion. The after-hours rule continues to treat the full view as the
 monitored site.
 
-A single frame can trigger multiple hazards. Each positive assessment above the
-configured confidence threshold produces a red **STOP WORK** alert with its
-cause and triggering frame. The receiver separately
-latches the construction safety state red, and that state remains red even if
-the operator switches modes or clears the System Log. It returns to green only
-when the operator explicitly asks the supervisor to clear or acknowledge the
-safety state. A new visible hazard can latch it red again.
+A single frame can trigger multiple detections. Positive **Fire Hazard**,
+**Work-Zone Intrusion**, and **Unauthorized Entry** assessments above the
+configured confidence threshold produce audible red **STOP WORK** alerts with
+their cause and triggering frame. The receiver separately latches the
+construction safety state red, and that state remains red even if the operator
+switches modes or clears the System Log. It returns to green only when the
+operator explicitly asks the supervisor to clear or acknowledge the safety
+state. A new visible hazard can latch it red again.
+
+A positive **Obstacle Hazard** assessment is handled differently: the dashboard
+shows a temporary yellow/orange **Obstacle warning** on Live Feed, records a
+highlighted warning and triggering frame in System Logs, and does not play an
+alarm or latch the red construction safety state. It therefore does not require
+operator clearance. The VLM still evaluates the same machine-obstacle
+relationship in the same combined Safety Mode request; only the downstream
+dashboard handling differs.
 
 Every zone starts in Free Mode. Entering Free Mode for selected zones stops their
 active Search or Safety scans, clears their objectives, and normalizes only their
@@ -342,8 +360,27 @@ the supervisor is running, it reads the receiver's latest fresh frame and saves
 one timestamped JPEG per registered camera during every clock minute, all day,
 in the configured site timezone. If a camera is unavailable or its frame is
 stale, the recorder retries during that same minute. Each camera and minute is
-stored only once. The evidence is placed under the operating system's temporary
-directory by default; use `REPORTING_SNAPSHOT_DIR` to choose another location.
+stored only once. By default, the evidence is kept persistently inside the
+repository under `data/reporting_snapshots`, organized for later inspection as:
+
+```text
+data/reporting_snapshots/
+└── 2026-08-26/
+    └── zone-0/
+        └── camera-0/
+            ├── 09-31.jpg
+            ├── 09-31.json
+            ├── 09-32.jpg
+            └── 09-32.json
+```
+
+The JPEG is the saved camera frame and its same-named JSON file records the
+camera, zone, scheduled minute, actual capture time, and receiver timestamp.
+Snapshots are not automatically deleted, so site tests remain available for
+later investigation even if report generation is unsuccessful. The runtime
+archive is excluded from Git by default to avoid committing a growing collection
+of potentially sensitive site imagery. Set `REPORTING_SNAPSHOT_DIR` only when a
+different persistent storage location is desired.
 
 When the operator asks for a report, a recent duration and at least one zone must
 be named. Natural durations are converted to minutes—for example, "past 5

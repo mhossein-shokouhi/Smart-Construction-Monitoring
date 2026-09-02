@@ -46,8 +46,10 @@ PLACEHOLDER_OPERATIONAL_MODES = {"investigation"}
 SAFETY_HAZARD_NAMES = {
     "fire_smoke": "Fire Hazard",
     "work_zone_encroachment": "Work-Zone Intrusion",
+    "machine_obstacle_proximity": "Obstacle Hazard",
     "after_hours_intrusion": "Unauthorized Entry",
 }
+SAFETY_WARNING_KEYS = {"machine_obstacle_proximity"}
 _system_state = {
     "mode": "free",
     "objective": None,
@@ -166,6 +168,10 @@ def _log_system_event(payload: dict) -> dict:
         value = payload.get(field)
         if value is not None:
             entry[field] = str(value)
+
+    audible = payload.get("audible")
+    if isinstance(audible, bool):
+        entry["audible"] = audible
 
     frame_b64 = payload.get("frame_jpeg_b64")
     if frame_b64:
@@ -474,11 +480,17 @@ async def latch_safety_hazard(request: Request):
 
     cause = str(payload.get("cause") or "").strip() or "Visible evidence triggered this safety check."
     zone = CAMERA_REGISTRY.get(camera_id, {}).get("zone", "Unassigned")
-    message = f"STOP WORK — {hazard_name} in {zone} on camera {camera_id}: {cause}"
+    is_warning = hazard_key in SAFETY_WARNING_KEYS
+    message = (
+        f"WARNING — {hazard_name} in {zone} on camera {camera_id}: {cause}"
+        if is_warning
+        else f"STOP WORK — {hazard_name} in {zone} on camera {camera_id}: {cause}"
+    )
     now = time.time()
     event_payload = {
-        "kind": "safety_alert",
-        "level": "critical",
+        "kind": "safety_warning" if is_warning else "safety_alert",
+        "level": "warning" if is_warning else "critical",
+        "audible": not is_warning,
         "message": message,
         "hazard_key": hazard_key,
         "hazard_name": hazard_name,
@@ -491,6 +503,10 @@ async def latch_safety_hazard(request: Request):
 
     with _lock:
         event = _log_system_event(event_payload)
+        if is_warning:
+            state = _system_state_copy_locked()
+            return JSONResponse({"status": "ok", "event": event, "state": state})
+
         hazard = {
             "hazard_key": hazard_key,
             "hazard_name": hazard_name,
@@ -776,6 +792,48 @@ INDEX_HTML = r"""<!DOCTYPE html>
       border-radius: 7px;
       background: rgba(255,255,255,0.1);
       color: #fff;
+      font: inherit;
+      font-size: 0.75rem;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .global-safety-warning-banner {
+      width: 100%;
+      max-width: 1200px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 18px;
+      padding: 14px 16px;
+      border: 1px solid rgba(251, 191, 36, 0.72);
+      border-radius: 10px;
+      background: linear-gradient(135deg, rgba(120, 53, 15, 0.9), rgba(69, 26, 3, 0.82));
+      box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.14), 0 12px 30px rgba(120, 53, 15, 0.24);
+    }
+    .global-safety-warning-banner[hidden] {
+      display: none;
+    }
+    .global-safety-warning-title {
+      color: #fef3c7;
+      font-size: 1rem;
+      font-weight: 800;
+      letter-spacing: 0.03em;
+    }
+    .global-safety-warning-detail {
+      margin-top: 3px;
+      color: #fde68a;
+      font-size: 0.8125rem;
+      line-height: 1.35;
+    }
+    .global-safety-warning-action {
+      flex-shrink: 0;
+      min-height: 34px;
+      padding: 0 12px;
+      border: 1px solid rgba(254, 243, 199, 0.48);
+      border-radius: 7px;
+      background: rgba(255,255,255,0.08);
+      color: #fef3c7;
       font: inherit;
       font-size: 0.75rem;
       font-weight: 700;
@@ -1545,6 +1603,22 @@ INDEX_HTML = r"""<!DOCTYPE html>
       color: #fecaca;
       font-weight: 800;
     }
+    .system-entry.safety-warning {
+      margin: 8px 0;
+      padding: 14px 12px;
+      border: 1px solid rgba(245, 158, 11, 0.5);
+      border-radius: 8px;
+      background: linear-gradient(135deg, rgba(120, 53, 15, 0.34), rgba(69, 26, 3, 0.12));
+    }
+    .system-entry.safety-warning .badge {
+      color: #fef3c7;
+      border-color: rgba(251, 191, 36, 0.72);
+      background: rgba(180, 83, 9, 0.76);
+    }
+    .system-entry.safety-warning .content strong {
+      color: #fde68a;
+      font-weight: 800;
+    }
     .system-entry.safety-clear .badge {
       color: #67e8a5;
       border-color: rgba(52, 211, 153, 0.4);
@@ -1585,6 +1659,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
       .alarm-audio-button { width: 100%; margin-left: 0; justify-content: center; }
       .global-safety-banner { align-items: stretch; flex-direction: column; }
       .global-safety-action { width: 100%; }
+      .global-safety-warning-banner { align-items: stretch; flex-direction: column; }
+      .global-safety-warning-action { width: 100%; }
     }
   </style>
 </head>
@@ -1627,6 +1703,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <div class="global-safety-detail" id="global-safety-detail">Operator clearance required.</div>
     </div>
     <button type="button" class="global-safety-action" id="global-safety-action">View safety details</button>
+  </div>
+  <div class="global-safety-warning-banner" id="global-safety-warning-banner" role="status" aria-live="polite" hidden>
+    <div>
+      <div class="global-safety-warning-title">Obstacle warning</div>
+      <div class="global-safety-warning-detail" id="global-safety-warning-detail">A machine-obstacle proximity risk was detected.</div>
+    </div>
+    <button type="button" class="global-safety-warning-action" id="global-safety-warning-action">View details</button>
   </div>
   <section class="tab-view active" id="live-view">
   <div class="layout" id="single-camera-layout">
@@ -1748,14 +1831,19 @@ INDEX_HTML = r"""<!DOCTYPE html>
       const systemLogList = document.getElementById('system-log-list');
       const globalSafetyBanner = document.getElementById('global-safety-banner');
       const globalSafetyDetail = document.getElementById('global-safety-detail');
+      const globalSafetyWarningBanner = document.getElementById('global-safety-warning-banner');
+      const globalSafetyWarningDetail = document.getElementById('global-safety-warning-detail');
       const alarmAudioButton = document.getElementById('alarm-audio-button');
       const alarmAudioLabel = document.getElementById('alarm-audio-label');
       const dashboardStartedAt = Date.now() / 1000;
       let systemLogInitialized = false;
       let lastAlertEventId = 0;
+      let lastWarningEventId = 0;
       let lastSoundedAlertEventId = 0;
       let pendingAlarmEventId = 0;
       let alarmContext = null;
+      let safetyHazardActive = false;
+      let warningBannerTimer = null;
 
       function setView(view) {
         const showSystem = view === 'system';
@@ -1764,6 +1852,26 @@ INDEX_HTML = r"""<!DOCTYPE html>
         systemView.classList.toggle('active', showSystem);
         viewTabs.forEach(tab => tab.classList.toggle('active', tab.dataset.view === view));
         syncStreamConnections();
+      }
+
+      function hideSafetyWarning() {
+        globalSafetyWarningBanner.hidden = true;
+        if (warningBannerTimer !== null) {
+          clearTimeout(warningBannerTimer);
+          warningBannerTimer = null;
+        }
+      }
+
+      function showSafetyWarning(entry) {
+        if (!entry || safetyHazardActive) return;
+        const location = [entry.zone, entry.camera_id != null ? 'Camera ' + entry.camera_id : '']
+          .filter(Boolean)
+          .join(' · ');
+        globalSafetyWarningDetail.textContent = (entry.cause || entry.message || 'Machine-obstacle proximity risk detected.')
+          + (location ? ' — ' + location : '');
+        globalSafetyWarningBanner.hidden = false;
+        if (warningBannerTimer !== null) clearTimeout(warningBannerTimer);
+        warningBannerTimer = setTimeout(hideSafetyWarning, 12000);
       }
 
       viewTabs.forEach(tab => {
@@ -1840,6 +1948,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       });
       alarmAudioButton.addEventListener('click', unlockAlarmAudio);
       document.getElementById('global-safety-action').addEventListener('click', () => setView('system'));
+      document.getElementById('global-safety-warning-action').addEventListener('click', () => setView('system'));
 
       function parseUrlSelection() {
         if (window.location.hash === '#view=grid' || window.location.hash === '#grid') {
@@ -2321,22 +2430,28 @@ INDEX_HTML = r"""<!DOCTYPE html>
         const level = entry.level || 'info';
         const isSearchAlert = entry.kind === 'alert';
         const isSafetyAlert = entry.kind === 'safety_alert';
+        const isSafetyWarning = entry.kind === 'safety_warning';
         const isSafetyClear = entry.kind === 'safety_clear';
         const rowClass = 'system-entry' + (
           isSafetyAlert ? ' safety-alert' : (
-            isSearchAlert ? ' alert' : (
-              isSafetyClear ? ' safety-clear' : (level === 'warning' ? ' warning' : '')
+            isSafetyWarning ? ' safety-warning' : (
+              isSearchAlert ? ' alert' : (
+                isSafetyClear ? ' safety-clear' : (level === 'warning' ? ' warning' : '')
+              )
             )
           )
         );
         const label = isSafetyAlert
           ? 'Stop work'
-          : (isSearchAlert ? 'Match' : (isSafetyClear ? 'Clear' : (level === 'warning' ? 'Warning' : (entry.kind || 'System'))));
-        const body = (isSearchAlert || isSafetyAlert)
+          : (isSafetyWarning ? 'Obstacle warning' : (isSearchAlert ? 'Match' : (isSafetyClear ? 'Clear' : (level === 'warning' ? 'Warning' : (entry.kind || 'System')))));
+        const body = (isSearchAlert || isSafetyAlert || isSafetyWarning)
           ? '<strong>' + escapeHtml(entry.message || '') + '</strong>'
           : escapeHtml(entry.message || '');
+        const frameAlt = isSafetyAlert
+          ? 'Safety hazard frame'
+          : (isSafetyWarning ? 'Safety warning frame' : 'Search match frame');
         const frame = entry.frame_url
-          ? '<img src="' + escapeHtml(entry.frame_url) + '" alt="' + (isSafetyAlert ? 'Safety hazard frame' : 'Search match frame') + '" loading="lazy">'
+          ? '<img src="' + escapeHtml(entry.frame_url) + '" alt="' + frameAlt + '" loading="lazy">'
           : '';
         return (
           '<div class="' + rowClass + '">' +
@@ -2363,6 +2478,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
               : (mode === 'free' ? 'No workflow' : 'Placeholder');
 
             const safetyHazard = state.safety_status === 'hazard';
+            safetyHazardActive = safetyHazard;
+            if (safetyHazard) hideSafetyWarning();
             const activeHazards = Array.isArray(state.active_safety_hazards)
               ? state.active_safety_hazards
               : [];
@@ -2417,16 +2534,40 @@ INDEX_HTML = r"""<!DOCTYPE html>
         fetch('/system/log')
           .then(r => r.json())
           .then(entries => {
-            const alerts = entries.filter(entry => entry.kind === 'alert' || entry.kind === 'safety_alert');
+            const alerts = entries.filter(entry => (
+              entry.kind === 'alert' || entry.kind === 'safety_alert'
+            ) && entry.audible !== false);
+            const safetyAlerts = entries.filter(entry => entry.kind === 'safety_alert');
+            const warnings = entries.filter(entry => entry.kind === 'safety_warning');
             const newestAlertId = alerts.reduce((maxId, entry) => Math.max(maxId, entry.id || 0), 0);
+            const newestSafetyAlertId = safetyAlerts.reduce((maxId, entry) => Math.max(maxId, entry.id || 0), 0);
+            const newestWarningId = warnings.reduce((maxId, entry) => Math.max(maxId, entry.id || 0), 0);
             const alertArrivedAfterDashboardLoad = !systemLogInitialized && alerts.some(
               entry => Number(entry.time || 0) >= dashboardStartedAt
             );
+            const safetyAlertArrivedAfterDashboardLoad = !systemLogInitialized && safetyAlerts.some(
+              entry => Number(entry.time || 0) >= dashboardStartedAt
+            );
+            const warningArrivedAfterDashboardLoad = !systemLogInitialized && warnings.some(
+              entry => Number(entry.time || 0) >= dashboardStartedAt
+            );
+            const safetyAlertIsNew = (
+              systemLogInitialized && newestSafetyAlertId > lastAlertEventId
+            ) || safetyAlertArrivedAfterDashboardLoad;
+            const warningIsNew = (
+              systemLogInitialized && newestWarningId > lastWarningEventId
+            ) || warningArrivedAfterDashboardLoad;
             if ((systemLogInitialized && newestAlertId > lastAlertEventId) || alertArrivedAfterDashboardLoad) {
               pendingAlarmEventId = Math.max(pendingAlarmEventId, newestAlertId);
               playPendingAlarm();
             }
+            if (safetyAlertIsNew) {
+              hideSafetyWarning();
+            } else if (warningIsNew && !safetyHazardActive) {
+              showSafetyWarning(warnings[warnings.length - 1]);
+            }
             lastAlertEventId = Math.max(lastAlertEventId, newestAlertId);
+            lastWarningEventId = Math.max(lastWarningEventId, newestWarningId);
             systemLogInitialized = true;
 
             if (!entries.length) {
@@ -2450,8 +2591,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
         fetch('/system/log/clear', { method: 'POST' })
           .then(() => {
             lastAlertEventId = 0;
+            lastWarningEventId = 0;
             lastSoundedAlertEventId = 0;
             pendingAlarmEventId = 0;
+            hideSafetyWarning();
             updateAlarmAudioStatus();
             systemLogInitialized = false;
             refreshSystemLog();
