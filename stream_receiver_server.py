@@ -173,6 +173,10 @@ def _log_system_event(payload: dict) -> dict:
     if isinstance(audible, bool):
         entry["audible"] = audible
 
+    speak_announcement = payload.get("speak_announcement")
+    if isinstance(speak_announcement, bool):
+        entry["speak_announcement"] = speak_announcement
+
     frame_b64 = payload.get("frame_jpeg_b64")
     if frame_b64:
         try:
@@ -490,7 +494,7 @@ async def latch_safety_hazard(request: Request):
     event_payload = {
         "kind": "safety_warning" if is_warning else "safety_alert",
         "level": "warning" if is_warning else "critical",
-        "audible": not is_warning,
+        "audible": False,
         "message": message,
         "hazard_key": hazard_key,
         "hazard_name": hazard_name,
@@ -502,6 +506,11 @@ async def latch_safety_hazard(request: Request):
     }
 
     with _lock:
+        announce_transition = bool(
+            not is_warning and _system_state.get("safety_status") != "hazard"
+        )
+        event_payload["audible"] = announce_transition
+        event_payload["speak_announcement"] = announce_transition
         event = _log_system_event(event_payload)
         if is_warning:
             state = _system_state_copy_locked()
@@ -1692,9 +1701,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <span class="view-tab-dot"></span>
       <span>System Logs</span>
     </button>
-    <button type="button" class="alarm-audio-button" id="alarm-audio-button" aria-pressed="false" title="Enable dashboard alert sounds">
+    <button type="button" class="alarm-audio-button" id="alarm-audio-button" aria-pressed="false" title="Enable dashboard alert tones and spoken hazard announcements">
       <span class="dot"></span>
-      <span id="alarm-audio-label">Enable alert sound</span>
+      <span id="alarm-audio-label">Enable alert audio</span>
     </button>
   </nav>
   <div class="global-safety-banner" id="global-safety-banner" role="alert" aria-live="assertive" hidden>
@@ -1837,11 +1846,21 @@ INDEX_HTML = r"""<!DOCTYPE html>
       const alarmAudioLabel = document.getElementById('alarm-audio-label');
       const dashboardStartedAt = Date.now() / 1000;
       let systemLogInitialized = false;
-      let lastAlertEventId = 0;
+      let lastSafetyAlertEventId = 0;
       let lastWarningEventId = 0;
-      let lastSoundedAlertEventId = 0;
-      let pendingAlarmEventId = 0;
       let alarmContext = null;
+      let alertAudioArmed = false;
+      let pendingAlertAudioEvents = [];
+      let queuedAlertAudioEventIds = new Set();
+      let alertAudioQueueActive = false;
+      let activeAlertAudioEvent = null;
+      let activeSpeechUtterance = null;
+      let alertAudioCycleTimer = null;
+      let speechWatchdogTimer = null;
+      let alertAudioQueueGeneration = 0;
+      let lastProcessedSystemEventId = 0;
+      let systemLogRequestGeneration = 0;
+      let systemLogClearInProgress = false;
       let safetyHazardActive = false;
       let warningBannerTimer = null;
 
@@ -1878,64 +1897,244 @@ INDEX_HTML = r"""<!DOCTYPE html>
         tab.addEventListener('click', () => setView(tab.dataset.view));
       });
 
+      function speechSynthesisAvailable() {
+        return Boolean(
+          window.speechSynthesis && typeof window.SpeechSynthesisUtterance === 'function'
+        );
+      }
+
+      function preferredSpeechVoice() {
+        if (!speechSynthesisAvailable()) return null;
+        try {
+          const voices = window.speechSynthesis.getVoices();
+          const preferredLanguages = ['en-CA', 'en-US', 'en-GB'];
+          for (const language of preferredLanguages) {
+            const localVoice = voices.find(voice => (
+              voice.localService === true && String(voice.lang || '').toLowerCase() === language.toLowerCase()
+            ));
+            if (localVoice) return localVoice;
+          }
+          for (const language of preferredLanguages) {
+            const voice = voices.find(candidate => (
+              String(candidate.lang || '').toLowerCase() === language.toLowerCase()
+            ));
+            if (voice) return voice;
+          }
+          return voices.find(voice => /^en[-_]/i.test(String(voice.lang || ''))) || null;
+        } catch (_) {
+          return null;
+        }
+      }
+
+      function spokenHazardText(entry) {
+        const hazardName = String(entry.hazard_name || 'Safety hazard').trim();
+        const zone = String(entry.zone || '').trim();
+        const camera = entry.camera_id != null ? 'camera ' + entry.camera_id : '';
+        const location = [zone, camera].filter(Boolean).join(', ');
+        let cause = String(entry.cause || '').replace(/\s+/g, ' ').trim();
+        if (cause && !/[.!?]$/.test(cause)) cause += '.';
+        return [
+          'Stop work.',
+          hazardName + ' detected.',
+          location ? location + '.' : '',
+          cause,
+        ].filter(Boolean).join(' ');
+      }
+
+      function clearAlertAudioTimers() {
+        if (alertAudioCycleTimer !== null) {
+          clearTimeout(alertAudioCycleTimer);
+          alertAudioCycleTimer = null;
+        }
+        if (speechWatchdogTimer !== null) {
+          clearTimeout(speechWatchdogTimer);
+          speechWatchdogTimer = null;
+        }
+      }
+
+      function playAlarmTones() {
+        if (!alarmContext || alarmContext.state !== 'running') return false;
+        try {
+          const now = alarmContext.currentTime;
+          [0, 0.22, 0.44].forEach((offset) => {
+            const osc = alarmContext.createOscillator();
+            const gain = alarmContext.createGain();
+            osc.type = 'square';
+            osc.frequency.setValueAtTime(880, now + offset);
+            gain.gain.setValueAtTime(0.0001, now + offset);
+            gain.gain.exponentialRampToValueAtTime(0.13, now + offset + 0.02);
+            gain.gain.exponentialRampToValueAtTime(0.0001, now + offset + 0.16);
+            osc.connect(gain);
+            gain.connect(alarmContext.destination);
+            osc.start(now + offset);
+            osc.stop(now + offset + 0.18);
+          });
+          return true;
+        } catch (_) {
+          return false;
+        }
+      }
+
+      function finishAlertAudioCycle(generation) {
+        if (generation !== alertAudioQueueGeneration || !alertAudioQueueActive) return;
+        clearAlertAudioTimers();
+        activeSpeechUtterance = null;
+        activeAlertAudioEvent = null;
+        alertAudioQueueActive = false;
+        updateAlarmAudioStatus();
+        setTimeout(drainAlertAudioQueue, 120);
+      }
+
+      function speakSafetyAlert(entry, generation) {
+        if (generation !== alertAudioQueueGeneration || !alertAudioQueueActive) return;
+        alertAudioCycleTimer = null;
+        try {
+          const utterance = new window.SpeechSynthesisUtterance(spokenHazardText(entry));
+          const voice = preferredSpeechVoice();
+          if (voice) {
+            utterance.lang = voice.lang;
+            utterance.voice = voice;
+          }
+          utterance.rate = 0.92;
+          utterance.pitch = 1.0;
+          utterance.volume = 1.0;
+          utterance.onend = () => finishAlertAudioCycle(generation);
+          utterance.onerror = () => finishAlertAudioCycle(generation);
+          activeSpeechUtterance = utterance;
+          speechWatchdogTimer = setTimeout(() => {
+            if (generation !== alertAudioQueueGeneration) return;
+            try { window.speechSynthesis.cancel(); } catch (_) {}
+            finishAlertAudioCycle(generation);
+          }, 20000);
+          try { window.speechSynthesis.resume(); } catch (_) {}
+          window.speechSynthesis.speak(utterance);
+        } catch (_) {
+          finishAlertAudioCycle(generation);
+        }
+      }
+
+      function drainAlertAudioQueue() {
+        if (alertAudioQueueActive || !pendingAlertAudioEvents.length || !alertAudioArmed) {
+          updateAlarmAudioStatus();
+          return;
+        }
+        const toneAvailable = Boolean(alarmContext && alarmContext.state === 'running');
+        const speechAvailable = speechSynthesisAvailable();
+        const nextIndex = pendingAlertAudioEvents.findIndex(entry => (
+          toneAvailable || (
+            entry.kind === 'safety_alert' &&
+            entry.speak_announcement === true &&
+            speechAvailable
+          )
+        ));
+        if (nextIndex < 0) {
+          updateAlarmAudioStatus();
+          return;
+        }
+
+        const [entry] = pendingAlertAudioEvents.splice(nextIndex, 1);
+        alertAudioQueueActive = true;
+        activeAlertAudioEvent = entry;
+        const generation = alertAudioQueueGeneration;
+        const tonesPlayed = playAlarmTones();
+        const shouldSpeak = (
+          entry.kind === 'safety_alert' &&
+          entry.speak_announcement === true &&
+          speechAvailable
+        );
+        if (shouldSpeak) {
+          alertAudioCycleTimer = setTimeout(
+            () => speakSafetyAlert(entry, generation),
+            tonesPlayed ? 720 : 0
+          );
+        } else {
+          alertAudioCycleTimer = setTimeout(
+            () => finishAlertAudioCycle(generation),
+            tonesPlayed ? 700 : 0
+          );
+        }
+        updateAlarmAudioStatus();
+      }
+
+      function enqueueAlertAudio(entry, { deferDrain = false } = {}) {
+        const eventId = Number(entry && entry.id || 0);
+        if (
+          !eventId ||
+          !['alert', 'safety_alert'].includes(entry.kind) ||
+          entry.audible === false ||
+          queuedAlertAudioEventIds.has(eventId)
+        ) return;
+        queuedAlertAudioEventIds.add(eventId);
+        pendingAlertAudioEvents.push(entry);
+        pendingAlertAudioEvents.sort((left, right) => Number(left.id || 0) - Number(right.id || 0));
+        if (!deferDrain) drainAlertAudioQueue();
+      }
+
+      function cancelAlertAudio({ safetyOnly = false } = {}) {
+        pendingAlertAudioEvents = safetyOnly
+          ? pendingAlertAudioEvents.filter(entry => entry.kind !== 'safety_alert')
+          : [];
+        const cancelActive = Boolean(
+          activeAlertAudioEvent && (!safetyOnly || activeAlertAudioEvent.kind === 'safety_alert')
+        );
+        if (!cancelActive) {
+          updateAlarmAudioStatus();
+          return;
+        }
+
+        alertAudioQueueGeneration += 1;
+        clearAlertAudioTimers();
+        alertAudioQueueActive = false;
+        activeAlertAudioEvent = null;
+        activeSpeechUtterance = null;
+        if (speechSynthesisAvailable()) {
+          try { window.speechSynthesis.cancel(); } catch (_) {}
+        }
+        updateAlarmAudioStatus();
+        setTimeout(drainAlertAudioQueue, 0);
+      }
+
       function updateAlarmAudioStatus() {
-        const armed = Boolean(alarmContext && alarmContext.state === 'running');
-        const pending = pendingAlarmEventId > lastSoundedAlertEventId;
+        const toneArmed = Boolean(alarmContext && alarmContext.state === 'running');
+        const armed = alertAudioArmed && (toneArmed || speechSynthesisAvailable());
+        const pending = pendingAlertAudioEvents.length > 0 || alertAudioQueueActive;
         alarmAudioButton.classList.toggle('armed', armed);
         alarmAudioButton.classList.toggle('pending', pending && !armed);
         alarmAudioButton.setAttribute('aria-pressed', armed ? 'true' : 'false');
         alarmAudioLabel.textContent = armed
-          ? 'Alert sound on'
-          : (pending ? 'Enable sound — alert pending' : 'Enable alert sound');
-      }
-
-      function playPendingAlarm() {
-        if (pendingAlarmEventId <= lastSoundedAlertEventId) return true;
-        if (!alarmContext || alarmContext.state !== 'running') {
-          updateAlarmAudioStatus();
-          return false;
-        }
-        const eventId = pendingAlarmEventId;
-        const now = alarmContext.currentTime;
-        [0, 0.22, 0.44].forEach((offset) => {
-          const osc = alarmContext.createOscillator();
-          const gain = alarmContext.createGain();
-          osc.type = 'square';
-          osc.frequency.setValueAtTime(880, now + offset);
-          gain.gain.setValueAtTime(0.0001, now + offset);
-          gain.gain.exponentialRampToValueAtTime(0.13, now + offset + 0.02);
-          gain.gain.exponentialRampToValueAtTime(0.0001, now + offset + 0.16);
-          osc.connect(gain);
-          gain.connect(alarmContext.destination);
-          osc.start(now + offset);
-          osc.stop(now + offset + 0.18);
-        });
-        lastSoundedAlertEventId = eventId;
-        if (pendingAlarmEventId <= lastSoundedAlertEventId) pendingAlarmEventId = 0;
-        updateAlarmAudioStatus();
-        return true;
+          ? 'Alert audio on'
+          : (pending ? 'Enable audio — alert pending' : 'Enable alert audio');
       }
 
       async function prepareAlarmAudio() {
+        alertAudioArmed = true;
         const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
-        if (!AudioContextCtor) {
-          alarmAudioLabel.textContent = 'Alert sound unavailable';
+        if (AudioContextCtor) {
+          try {
+            if (!alarmContext || alarmContext.state === 'closed') {
+              alarmContext = new AudioContextCtor();
+              alarmContext.addEventListener('statechange', () => {
+                updateAlarmAudioStatus();
+                drainAlertAudioQueue();
+              });
+            }
+            if (alarmContext.state !== 'running') await alarmContext.resume();
+          } catch (_) {
+            // Speech can still announce critical safety events if Web Audio fails.
+          }
+        }
+        const available = Boolean(
+          (alarmContext && alarmContext.state === 'running') || speechSynthesisAvailable()
+        );
+        if (!available) {
+          alarmAudioLabel.textContent = 'Alert audio unavailable';
           alarmAudioButton.disabled = true;
           return false;
         }
-        if (!alarmContext || alarmContext.state === 'closed') {
-          alarmContext = new AudioContextCtor();
-          alarmContext.addEventListener('statechange', updateAlarmAudioStatus);
-        }
-        try {
-          if (alarmContext.state !== 'running') await alarmContext.resume();
-        } catch (_) {
-          updateAlarmAudioStatus();
-          return false;
-        }
+        alarmAudioButton.disabled = false;
         updateAlarmAudioStatus();
-        if (alarmContext.state === 'running') playPendingAlarm();
-        return alarmContext.state === 'running';
+        drainAlertAudioQueue();
+        return true;
       }
 
       function unlockAlarmAudio() {
@@ -2531,43 +2730,56 @@ INDEX_HTML = r"""<!DOCTYPE html>
       }
 
       function refreshSystemLog() {
+        if (systemLogClearInProgress) return;
+        const requestGeneration = ++systemLogRequestGeneration;
         fetch('/system/log')
           .then(r => r.json())
           .then(entries => {
-            const alerts = entries.filter(entry => (
-              entry.kind === 'alert' || entry.kind === 'safety_alert'
-            ) && entry.audible !== false);
+            if (requestGeneration !== systemLogRequestGeneration || systemLogClearInProgress) return;
             const safetyAlerts = entries.filter(entry => entry.kind === 'safety_alert');
             const warnings = entries.filter(entry => entry.kind === 'safety_warning');
-            const newestAlertId = alerts.reduce((maxId, entry) => Math.max(maxId, entry.id || 0), 0);
             const newestSafetyAlertId = safetyAlerts.reduce((maxId, entry) => Math.max(maxId, entry.id || 0), 0);
             const newestWarningId = warnings.reduce((maxId, entry) => Math.max(maxId, entry.id || 0), 0);
-            const alertArrivedAfterDashboardLoad = !systemLogInitialized && alerts.some(
-              entry => Number(entry.time || 0) >= dashboardStartedAt
-            );
             const safetyAlertArrivedAfterDashboardLoad = !systemLogInitialized && safetyAlerts.some(
               entry => Number(entry.time || 0) >= dashboardStartedAt
             );
             const warningArrivedAfterDashboardLoad = !systemLogInitialized && warnings.some(
               entry => Number(entry.time || 0) >= dashboardStartedAt
             );
+            const newSystemEntries = entries.filter(entry => (
+              systemLogInitialized
+                ? Number(entry.id || 0) > lastProcessedSystemEventId
+                : Number(entry.time || 0) >= dashboardStartedAt
+            )).sort((left, right) => Number(left.id || 0) - Number(right.id || 0));
             const safetyAlertIsNew = (
-              systemLogInitialized && newestSafetyAlertId > lastAlertEventId
+              systemLogInitialized && newestSafetyAlertId > lastSafetyAlertEventId
             ) || safetyAlertArrivedAfterDashboardLoad;
             const warningIsNew = (
               systemLogInitialized && newestWarningId > lastWarningEventId
             ) || warningArrivedAfterDashboardLoad;
-            if ((systemLogInitialized && newestAlertId > lastAlertEventId) || alertArrivedAfterDashboardLoad) {
-              pendingAlarmEventId = Math.max(pendingAlarmEventId, newestAlertId);
-              playPendingAlarm();
-            }
+            let hazardActiveAfterEntries = safetyHazardActive;
+            newSystemEntries.forEach(entry => {
+              if (entry.kind === 'safety_clear') {
+                hazardActiveAfterEntries = false;
+                cancelAlertAudio({ safetyOnly: true });
+              } else {
+                if (entry.kind === 'safety_alert') hazardActiveAfterEntries = true;
+                enqueueAlertAudio(entry, { deferDrain: true });
+              }
+            });
+            safetyHazardActive = hazardActiveAfterEntries;
+            drainAlertAudioQueue();
             if (safetyAlertIsNew) {
               hideSafetyWarning();
-            } else if (warningIsNew && !safetyHazardActive) {
+            } else if (warningIsNew && !hazardActiveAfterEntries) {
               showSafetyWarning(warnings[warnings.length - 1]);
             }
-            lastAlertEventId = Math.max(lastAlertEventId, newestAlertId);
+            lastSafetyAlertEventId = Math.max(lastSafetyAlertEventId, newestSafetyAlertId);
             lastWarningEventId = Math.max(lastWarningEventId, newestWarningId);
+            lastProcessedSystemEventId = entries.reduce(
+              (maxId, entry) => Math.max(maxId, Number(entry.id || 0)),
+              lastProcessedSystemEventId
+            );
             systemLogInitialized = true;
 
             if (!entries.length) {
@@ -2588,18 +2800,23 @@ INDEX_HTML = r"""<!DOCTYPE html>
       });
 
       document.getElementById('system-log-clear-btn').addEventListener('click', () => {
+        systemLogClearInProgress = true;
+        systemLogRequestGeneration += 1;
+        cancelAlertAudio();
+        hideSafetyWarning();
         fetch('/system/log/clear', { method: 'POST' })
           .then(() => {
-            lastAlertEventId = 0;
-            lastWarningEventId = 0;
-            lastSoundedAlertEventId = 0;
-            pendingAlarmEventId = 0;
-            hideSafetyWarning();
+            systemLogClearInProgress = false;
+            systemLogRequestGeneration += 1;
             updateAlarmAudioStatus();
-            systemLogInitialized = false;
+            systemLogList.innerHTML = '<div class="system-log-empty">No system events yet.</div>';
             refreshSystemLog();
           })
-          .catch(() => {});
+          .catch(() => {
+            systemLogClearInProgress = false;
+            systemLogRequestGeneration += 1;
+            refreshSystemLog();
+          });
       });
 
       window.addEventListener('hashchange', () => {
@@ -2614,6 +2831,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       document.addEventListener('visibilitychange', syncStreamConnections);
       window.addEventListener('pageshow', syncStreamConnections);
       window.addEventListener('pagehide', () => {
+        cancelAlertAudio();
         disconnectSingleStream();
         disconnectGridStreams();
       });

@@ -976,6 +976,7 @@ class ReceiverOperationalStateTests(unittest.TestCase):
         self.assertEqual(alert["kind"], "safety_alert")
         self.assertEqual(alert["level"], "critical")
         self.assertTrue(alert["audible"])
+        self.assertTrue(alert["speak_announcement"])
         self.assertIn("STOP WORK", alert["message"])
         self.assertNotIn("stop_note", alert)
 
@@ -1027,6 +1028,7 @@ class ReceiverOperationalStateTests(unittest.TestCase):
                 self.assertEqual(event["kind"], "safety_alert")
                 self.assertEqual(event["level"], "critical")
                 self.assertTrue(event["audible"])
+                self.assertTrue(event["speak_announcement"])
                 self.assertIn("STOP WORK", event["message"])
                 self.assertEqual(result["state"]["safety_status"], "hazard")
                 self.assertEqual(
@@ -1054,6 +1056,7 @@ class ReceiverOperationalStateTests(unittest.TestCase):
         self.assertEqual(event["kind"], "safety_warning")
         self.assertEqual(event["level"], "warning")
         self.assertFalse(event["audible"])
+        self.assertFalse(event["speak_announcement"])
         self.assertIn("WARNING", event["message"])
         self.assertNotIn("STOP WORK", event["message"])
         self.assertEqual(result["state"]["safety_status"], "clear")
@@ -1062,6 +1065,100 @@ class ReceiverOperationalStateTests(unittest.TestCase):
         frame = self.client.get(event["frame_url"])
         self.assertEqual(frame.status_code, 200)
         self.assertEqual(frame.content, b"jpeg")
+
+    def test_only_first_critical_hazard_in_red_state_is_marked_for_speech(self):
+        first = self.client.post(
+            "/system/safety/hazard",
+            json={
+                "hazard_key": "fire_smoke",
+                "camera_id": 0,
+                "confidence": 0.96,
+                "cause": "Smoke is visible above the work area.",
+            },
+        ).json()["event"]
+        repeated = self.client.post(
+            "/system/safety/hazard",
+            json={
+                "hazard_key": "fire_smoke",
+                "camera_id": 0,
+                "confidence": 0.97,
+                "cause": "Smoke remains visible above the work area.",
+            },
+        ).json()["event"]
+        additional = self.client.post(
+            "/system/safety/hazard",
+            json={
+                "hazard_key": "work_zone_encroachment",
+                "camera_id": 1,
+                "confidence": 0.95,
+                "cause": "A person is inside the machine's working area.",
+            },
+        ).json()["event"]
+
+        self.assertTrue(first["speak_announcement"])
+        self.assertFalse(repeated["speak_announcement"])
+        self.assertFalse(additional["speak_announcement"])
+        self.assertTrue(first["audible"])
+        self.assertFalse(repeated["audible"])
+        self.assertFalse(additional["audible"])
+        self.assertEqual(repeated["cause"], "Smoke remains visible above the work area.")
+        self.assertIn("STOP WORK", additional["message"])
+
+    def test_only_explicit_safety_clear_rearms_spoken_announcement(self):
+        first = self.client.post(
+            "/system/safety/hazard",
+            json={
+                "hazard_key": "work_zone_encroachment",
+                "camera_id": 0,
+                "cause": "A person is close to the leveling machine.",
+            },
+        ).json()["event"]
+        self.assertTrue(first["speak_announcement"])
+
+        self.client.post("/system/log/clear")
+        self.client.post("/system/state", json={"mode": "free"})
+        while_red = self.client.post(
+            "/system/safety/hazard",
+            json={
+                "hazard_key": "after_hours_intrusion",
+                "camera_id": 0,
+                "cause": "A person is visible after hours.",
+            },
+        ).json()["event"]
+        self.assertFalse(while_red["speak_announcement"])
+        self.assertEqual(self.client.get("/system/state").json()["safety_status"], "hazard")
+
+        self.client.post("/system/safety/clear", json={"reason": "Area inspected."})
+        after_clear = self.client.post(
+            "/system/safety/hazard",
+            json={
+                "hazard_key": "after_hours_intrusion",
+                "camera_id": 0,
+                "cause": "A new person entered after the area was cleared.",
+            },
+        ).json()["event"]
+        self.assertTrue(after_clear["speak_announcement"])
+
+    def test_warning_does_not_consume_critical_speech_transition(self):
+        warning = self.client.post(
+            "/system/safety/hazard",
+            json={
+                "hazard_key": "machine_obstacle_proximity",
+                "camera_id": 0,
+                "cause": "A traffic cone is in the machine's path.",
+            },
+        ).json()["event"]
+        critical = self.client.post(
+            "/system/safety/hazard",
+            json={
+                "hazard_key": "work_zone_encroachment",
+                "camera_id": 0,
+                "cause": "A person is in the machine's immediate working area.",
+            },
+        ).json()["event"]
+
+        self.assertFalse(warning["speak_announcement"])
+        self.assertTrue(critical["speak_announcement"])
 
     def test_obstacle_warning_does_not_change_an_existing_stop_work_hazard(self):
         hazard_response = self.client.post(
@@ -1122,16 +1219,30 @@ class ReceiverOperationalStateTests(unittest.TestCase):
         self.assertIn('id="global-safety-banner"', html)
         self.assertIn('id="global-safety-warning-banner"', html)
         self.assertIn('id="alarm-audio-button"', html)
-        self.assertIn("pendingAlarmEventId", html)
+        self.assertIn("Enable alert audio", html)
+        self.assertIn("pendingAlertAudioEvents", html)
+        self.assertIn("lastSafetyAlertEventId", html)
         self.assertIn("lastWarningEventId", html)
-        self.assertIn("lastSoundedAlertEventId", html)
+        self.assertIn("lastProcessedSystemEventId", html)
         self.assertIn("dashboardStartedAt", html)
         self.assertIn("Safety hazard frame", html)
         self.assertIn("Safety warning frame", html)
         self.assertIn("safety-alert", html)
         self.assertIn("safety-warning", html)
         self.assertIn("entry.kind === 'safety_warning'", html)
-        self.assertIn("entry.audible !== false", html)
+        self.assertIn("entry.audible === false", html)
+        self.assertIn("SpeechSynthesisUtterance", html)
+        self.assertIn("speechSynthesisAvailable", html)
+        self.assertIn("preferredSpeechVoice", html)
+        self.assertIn("spokenHazardText", html)
+        self.assertIn("queuedAlertAudioEventIds", html)
+        self.assertIn("alertAudioQueueGeneration", html)
+        self.assertIn("entry.speak_announcement === true", html)
+        self.assertIn("enqueueAlertAudio(entry, { deferDrain: true })", html)
+        self.assertIn("cancelAlertAudio({ safetyOnly: true })", html)
+        self.assertIn("hazardActiveAfterEntries", html)
+        self.assertIn("systemLogRequestGeneration", html)
+        self.assertIn("systemLogClearInProgress", html)
         self.assertIn("showSafetyWarning", html)
         self.assertIn("Search match frame", html)
         self.assertNotIn("Emergency intent", html)

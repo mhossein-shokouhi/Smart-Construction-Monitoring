@@ -325,12 +325,20 @@ monitored site.
 
 A single frame can trigger multiple detections. Positive **Fire Hazard**,
 **Work-Zone Intrusion**, and **Unauthorized Entry** assessments above the
-configured confidence threshold produce audible red **STOP WORK** alerts with
-their cause and triggering frame. The receiver separately latches the
-construction safety state red, and that state remains red even if the operator
-switches modes or clears the System Log. It returns to green only when the
-operator explicitly asks the supervisor to clear or acknowledge the safety
-state. A new visible hazard can latch it red again.
+configured confidence threshold produce red **STOP WORK** alerts with their
+cause and triggering frame. The first critical event that changes construction
+safety from clear to red plays the alarm tones and speaks a concise announcement
+containing the hazard name, zone, camera, and VLM-generated cause. Repeated or
+additional detections remain visible in the log but produce no further alert
+audio while the red state is latched, preventing overlapping or repetitive
+announcements. Alert audio is re-armed only after the operator explicitly clears
+the safety state. Switching modes or clearing the System Log does not re-arm it.
+
+Spoken alerts use the standard browser speech-synthesis interface and prefer an
+installed local English voice in this order: Canadian, US, then UK English.
+Firefox, Chrome, and other standard browsers fall back to their available
+English or default voice. The operator must enable alert audio once after a
+fresh page load because browsers restrict unsolicited audio playback.
 
 A positive **Obstacle Hazard** assessment is handled differently: the dashboard
 shows a temporary yellow/orange **Obstacle warning** on Live Feed, records a
