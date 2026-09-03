@@ -968,9 +968,13 @@ Behaviour rules:
   09:00-17:00 site-local construction window, those checks are `Fire Hazard`,
   `Work-Zone Intrusion`, and `Obstacle Hazard`. Work-Zone Intrusion requires a
   recognizable white or light-colored leveling machine and a person close enough
-  to share its immediate working space or likely path of movement. It excludes
-  someone clearly distant or only in the background and the normal operator
-  properly seated at the machine.
+  to share its immediate working space or likely path of movement. It becomes a
+  hazard only when that nearby person is visibly missing a high-visibility safety
+  vest, a protective hard hat or helmet, or both. A nearby person clearly wearing
+  both required items is compliant and does not trigger this check. It also excludes
+  someone clearly distant or only in the background and the normal operator properly
+  seated at the machine. After hours, PPE does not exempt a person from Unauthorized
+  Entry.
   Obstacle Hazard requires that same recognizable machine plus a substantial obstacle,
   such as a traffic cone or a large green, blue, or white pipe on the ground, visibly
   close to the machine or directly in its apparent travel or working path. Do not treat

@@ -30,10 +30,19 @@ SAFETY_HAZARDS: dict[str, dict[str, str]] = {
             "visibly close enough to share the machine's immediate working space or likely path of "
             "movement. Treat a person directly in front of the machine, beside its active working "
             "area, or otherwise near enough for a plausible contact or struck-by risk as an "
-            "intrusion. Do not require an exact measured distance, proof that the machine is moving, "
-            "or one precise body position. Do not trigger for someone clearly far away or only in "
-            "the background, or for the normal operator properly seated on the machine or at its "
-            "normal rear operating position."
+            "intrusion candidate. After confirming that risky machine-person relationship, assess "
+            "the same nearby person's required PPE. Set detected=true only when that person is "
+            "visibly missing one or both required items: a recognizable high-visibility safety vest "
+            "and a protective hard hat or safety helmet. A nearby person clearly wearing both items "
+            "is compliant and must not trigger this check; wearing only one still triggers when the "
+            "other item is visibly absent. Do not guess that a cropped, blurred, small, or occluded "
+            "head or torso lacks PPE; when no missing item can be established reliably, set "
+            "detected=false. When several people are present, evaluate each person separately and "
+            "trigger if any nearby non-operator person visibly lacks either item. Do not require an "
+            "exact measured distance, proof that the machine is moving, or one precise body "
+            "position. Do not trigger for someone clearly far away or only in the background, or "
+            "for the normal operator properly seated on the machine or at its normal rear operating "
+            "position."
         ),
     },
     "machine_obstacle_proximity": {
@@ -226,7 +235,11 @@ class SafetyScanner(SearchScanner):
                 "Account for camera perspective, relative scale, overlap, and apparent ground "
                 "position. Favor detection when a reasonable observer would consider the person "
                 "inside the machine's immediate operating area; do not demand exact geometric "
-                "boundaries."
+                "boundaries. Decide machine-person proximity first, then assess the required vest "
+                "and helmet on that same person. A normal bright shirt is not automatically a "
+                "safety vest, and a cap or hood is not a hard hat or safety helmet. Do not combine "
+                "PPE worn by different people. A positive cause must state whether the nearby "
+                "person visibly lacks the vest, the helmet, or both."
             )
         if "machine_obstacle_proximity" in hazard_keys:
             proximity_guidance += (

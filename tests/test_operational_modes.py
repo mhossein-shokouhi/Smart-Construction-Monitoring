@@ -350,6 +350,9 @@ class OperationalModeTests(unittest.TestCase):
         self.assertIn("Never\n  change an unmentioned zone", supervisor.SYSTEM_PROMPT)
         self.assertIn("Fire Hazard", supervisor.SYSTEM_PROMPT)
         self.assertIn("Work-Zone Intrusion", supervisor.SYSTEM_PROMPT)
+        self.assertIn("protective hard hat or helmet", supervisor.SYSTEM_PROMPT)
+        self.assertIn("both required items is compliant", supervisor.SYSTEM_PROMPT)
+        self.assertIn("PPE does not exempt", supervisor.SYSTEM_PROMPT)
         self.assertIn("Obstacle Hazard", supervisor.SYSTEM_PROMPT)
         self.assertIn("Unauthorized Entry", supervisor.SYSTEM_PROMPT)
         self.assertIn("silent dashboard warning", supervisor.SYSTEM_PROMPT)
@@ -686,6 +689,14 @@ class SafetyScannerTests(unittest.TestCase):
         self.assertIn("immediate working space", prompt)
         self.assertIn("properly seated", prompt)
         self.assertIn("do not demand exact geometric boundaries", prompt)
+        self.assertIn("visibly missing one or both required items", prompt)
+        self.assertIn("high-visibility safety vest", prompt)
+        self.assertIn("protective hard hat or safety helmet", prompt)
+        self.assertIn("clearly wearing both items is compliant", prompt)
+        self.assertIn("wearing only one still triggers", prompt)
+        self.assertIn("Do not guess", prompt)
+        self.assertIn("Do not combine PPE worn by different people", prompt)
+        self.assertIn("positive cause must state whether", prompt)
         self.assertIn("traffic cones", prompt)
         self.assertIn("green, blue, or white pipes", prompt)
         self.assertIn("mere co-occurrence in the frame is negative", prompt)
@@ -702,7 +713,7 @@ class SafetyScannerTests(unittest.TestCase):
         output = (
             '{"assessments":{'
             '"fire_smoke":{"detected":true,"confidence":0.96,"cause":"Flames and dark smoke are visible."},'
-            '"work_zone_encroachment":{"detected":true,"confidence":0.91,"cause":"A person is inside the work zone."},'
+            '"work_zone_encroachment":{"detected":true,"confidence":0.91,"cause":"A nearby person lacks both a safety vest and a helmet."},'
             '"machine_obstacle_proximity":{"detected":true,"confidence":0.94,"cause":"A wide green pipe is directly in front of the machine."}'
             '}}'
         )
@@ -724,6 +735,56 @@ class SafetyScannerTests(unittest.TestCase):
             {call.kwargs["hazard_key"] for call in post_hazard.call_args_list},
             {"fire_smoke", "work_zone_encroachment", "machine_obstacle_proximity"},
         )
+
+    def test_compliant_nearby_person_does_not_publish_work_zone_hazard(self):
+        output = (
+            '{"assessments":{'
+            '"fire_smoke":{"detected":false,"confidence":0.0,"cause":""},'
+            '"work_zone_encroachment":{"detected":false,"confidence":0.96,"cause":""},'
+            '"machine_obstacle_proximity":{"detected":false,"confidence":0.0,"cause":""}'
+            '}}'
+        )
+        scanner = self._scanner(
+            output,
+            datetime(2026, 8, 17, 12, 0, tzinfo=self.timezone),
+        )
+
+        with patch.object(
+            scanner,
+            "_latest_frame",
+            return_value=(b"jpeg", 1.0),
+        ), patch.object(scanner, "_post_hazard") as post_hazard:
+            scanner._scan_camera_once(2, scanner._generation, "ignored")
+
+        self.assertEqual(scanner.client.responses.create_count, 1)
+        post_hazard.assert_not_called()
+
+    def test_nearby_person_visibly_missing_ppe_publishes_work_zone_hazard(self):
+        output = (
+            '{"assessments":{'
+            '"fire_smoke":{"detected":false,"confidence":0.0,"cause":""},'
+            '"work_zone_encroachment":{"detected":true,"confidence":0.92,'
+            '"cause":"A nearby person is not wearing a safety vest or helmet."},'
+            '"machine_obstacle_proximity":{"detected":false,"confidence":0.0,"cause":""}'
+            '}}'
+        )
+        scanner = self._scanner(
+            output,
+            datetime(2026, 8, 17, 12, 0, tzinfo=self.timezone),
+        )
+
+        with patch.object(
+            scanner,
+            "_latest_frame",
+            return_value=(b"jpeg", 1.0),
+        ), patch.object(scanner, "_post_hazard", return_value=True) as post_hazard:
+            scanner._scan_camera_once(2, scanner._generation, "ignored")
+
+        self.assertEqual(scanner.client.responses.create_count, 1)
+        post_hazard.assert_called_once()
+        self.assertEqual(post_hazard.call_args.kwargs["hazard_key"], "work_zone_encroachment")
+        self.assertEqual(post_hazard.call_args.kwargs["confidence"], 0.92)
+        self.assertIn("not wearing a safety vest or helmet", post_hazard.call_args.kwargs["cause"])
 
     def test_low_confidence_obstacle_assessment_does_not_alert(self):
         output = (
@@ -773,6 +834,8 @@ class SafetyScannerTests(unittest.TestCase):
         self.assertNotIn("Obstacle Hazard", prompt)
         self.assertNotIn("leveling or grading machine", prompt)
         self.assertNotIn("immediate operating area", prompt)
+        self.assertNotIn("high-visibility safety vest", prompt)
+        self.assertNotIn("hard hat or safety helmet", prompt)
         self.assertEqual(required, ["fire_smoke", "after_hours_intrusion"])
 
     def test_safety_reasoning_effort_is_configurable_and_validated(self):

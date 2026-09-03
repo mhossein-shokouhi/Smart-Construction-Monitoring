@@ -300,9 +300,13 @@ construction hours, each frame is assessed for:
 - **Work-Zone Intrusion** — a white or predominantly light-colored leveling
   machine is recognizable, and a person is visibly close enough to share its
   immediate working space or likely path of movement. The assessment uses
-  practical scene perspective rather than an exact distance. It excludes a
-  person clearly far away or only in the background and the normal operator
-  properly seated at the machine.
+  practical scene perspective rather than an exact distance. A red hazard is
+  raised only when that nearby person is visibly missing a recognizable
+  high-visibility safety vest, a protective hard hat or safety helmet, or both.
+  A nearby person clearly wearing both is treated as compliant. The check does
+  not guess about PPE hidden by blur, cropping, distance, or occlusion, and it
+  continues to exclude a person clearly far away or only in the background and
+  the normal operator properly seated at the machine.
 - **Obstacle Hazard** — the same recognizable leveling machine is visibly close
   to a substantial obstacle or has one directly in its apparent travel or
   working path, creating a plausible contact risk if operation continues.
@@ -319,9 +323,11 @@ person present at the site. **Fire Hazard** remains active at all times. This
 decision is made in-process before the VLM request, so every frame still uses
 one model call.
 The working-hours rule uses the person's visible relationship to the leveling
-machine rather than treating any person anywhere in the camera view as an
-intrusion. The after-hours rule continues to treat the full view as the
-monitored site.
+machine and that same person's visible PPE rather than treating any person
+anywhere in the camera view as an intrusion. If several people are nearby, each
+person is assessed separately and any one visibly missing either required item
+can trigger the hazard. The after-hours rule continues to treat the full view as
+the monitored site regardless of PPE.
 
 A single frame can trigger multiple detections. Positive **Fire Hazard**,
 **Work-Zone Intrusion**, and **Unauthorized Entry** assessments above the
